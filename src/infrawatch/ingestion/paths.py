@@ -4,6 +4,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 import re
 from typing import Iterable, Sequence
+from .models import SceneSummary
+
 
 RAW_S2_SUBDIR = Path("raw") / "s2"
 PRODUCT_ID_ALLOWED = re.compile(r"[^A-Za-z0-9._-]+")
@@ -59,3 +61,10 @@ def select_asset_filename(url: str, fallback: str) -> str:
 
 def as_bbox_list(bbox: Iterable[float]) -> list[float]:
     return [float(value) for value in bbox]
+
+def scene_cache_dir(data_dir: Path, scene: SceneSummary) -> Path:
+    """
+    Backward-compatible alias used by CLI:
+    returns directory for a given scene under data_dir/raw/s2/<YYYYMMDD>/<product_id>
+    """
+    return scene_dir(data_dir, scene.acquisition_datetime, scene.product_id)

@@ -60,7 +60,8 @@ def main(argv: list[str] | None = None) -> int:
 
     scenes, query = client.search(request)
 
-    base_out = cfg.data_dir / "raw" / "s2"
+    base_out = cfg.data_dir
+
     logger.info("Saving data under %s", base_out)
 
     print("Planned Sentinel-2 scenes:")
