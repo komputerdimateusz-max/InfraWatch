@@ -22,7 +22,7 @@ class SceneSummary:
     cloud_cover: float | None
     bbox: tuple[float, float, float, float]
     footprint: Any | None
-    assets: dict[str, str]  # e.g. {"B04": "s3://eodata/...", "B08": "s3://eodata/..."}
+    assets: dict[str, str]  # e.g. {"B04": "s3://eodata/...", "B08": "...", "SCL": "..."}
 
 
 @dataclass(frozen=True)

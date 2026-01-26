@@ -261,7 +261,7 @@ def scene_from_feature(feature: Mapping[str, Any]) -> SceneSummary:
 
 def select_ndvi_assets(assets: Mapping[str, Any]) -> dict[str, str]:
     """
-    Select the minimum assets required to compute NDVI: B04 (red) and B08 (nir).
+    Select the minimum assets required to compute NDVI: B04 (red), B08 (nir), and SCL.
     STAC implementations may differ in exact keys; we try a few common patterns.
     """
     def pick(keys: list[str]) -> str | None:
@@ -273,14 +273,15 @@ def select_ndvi_assets(assets: Mapping[str, Any]) -> dict[str, str]:
 
     b04 = pick(["B04", "b04", "red", "B04_10m", "B04_20m"])
     b08 = pick(["B08", "b08", "nir", "B08_10m", "B08_20m"])
+    scl = pick(["SCL", "scl", "SCL_20m", "SCL20", "classification"])
 
-    missing = [name for name, val in (("B04", b04), ("B08", b08)) if not val]
+    missing = [name for name, val in (("B04", b04), ("B08", b08), ("SCL", scl)) if not val]
     if missing:
         raise RuntimeError(
             f"Missing required NDVI assets {missing}. Available STAC asset keys: {list(assets.keys())}"
         )
 
-    return {"B04": b04, "B08": b08}  # type: ignore[return-value]
+    return {"B04": b04, "B08": b08, "SCL": scl}  # type: ignore[return-value]
 
 
 def parse_datetime(value: str) -> datetime:
