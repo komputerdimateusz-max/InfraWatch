@@ -38,6 +38,9 @@ class NdviDetection:
 
 DATE_PATTERN = re.compile(r"(20\d{6})")
 LOG_PATH = Path("ui_runtime.log")
+DEFAULT_UTM_EPSG = 32633
+LONGITUDE_LIMIT_DEG = 180
+LATITUDE_LIMIT_DEG = 90
 
 
 def _get_logger() -> logging.Logger:
@@ -105,7 +108,34 @@ def load_geojson(path: Path) -> dict[str, Any]:
     return {"type": "FeatureCollection", "features": [{"type": "Feature", "geometry": payload, "properties": {}}]}
 
 
-def detect_geojson_crs(payload: dict[str, Any]):
+def _first_geojson_coordinate(payload: dict[str, Any]) -> Sequence[float] | None:
+    features = payload.get("features", [])
+    for feature in features:
+        geometry = feature.get("geometry") or {}
+        coordinates = geometry.get("coordinates")
+        if coordinates is None:
+            continue
+        for coord in iter_coordinates(coordinates):
+            if coord and len(coord) >= 2:
+                return coord
+    return None
+
+
+def _coordinates_look_projected(coord: Sequence[float] | None) -> bool:
+    if not coord or len(coord) < 2:
+        return False
+    return abs(coord[0]) > LONGITUDE_LIMIT_DEG or abs(coord[1]) > LATITUDE_LIMIT_DEG
+
+
+def normalize_crs(value):
+    from pyproj import CRS
+
+    if value is None:
+        return None
+    return CRS.from_user_input(value)
+
+
+def detect_geojson_crs(payload: dict[str, Any], ndvi_crs=None):
     from pyproj import CRS
 
     crs_payload = payload.get("crs")
@@ -114,12 +144,22 @@ def detect_geojson_crs(payload: dict[str, Any]):
         name = props.get("name")
         if name:
             return CRS.from_user_input(name)
+
+    coord = _first_geojson_coordinate(payload)
+    if _coordinates_look_projected(coord):
+        return normalize_crs(ndvi_crs) or CRS.from_epsg(DEFAULT_UTM_EPSG)
+
     return CRS.from_epsg(4326)
 
 
 def to_crs_transformer(source, target):
     from pyproj import Transformer
 
+    source = normalize_crs(source)
+    target = normalize_crs(target)
+
+    if source is None or target is None:
+        return None
     if source == target:
         return None
 
@@ -145,7 +185,10 @@ def prepare_lines_for_scoring(
     transformer = to_crs_transformer(source_crs, target_crs)
     transformed_features = []
     for feature in lines_payload.get("features", []):
-        geom = shape(feature.get("geometry"))
+        geometry = feature.get("geometry")
+        if geometry is None:
+            continue
+        geom = shape(geometry)
         projected = transform_geometry(geom, transformer)
         new_feature = dict(feature)
         new_feature["geometry"] = mapping(projected)
@@ -209,6 +252,20 @@ def load_ndvi_overlay(ndvi_path: Path) -> tuple[str, list[list[float]], Any] | N
         st.exception(exc)
         logger.exception("ndvi_overlay_failed path=%s", ndvi_path)
         return None
+
+
+def read_ndvi_crs(ndvi_path: Path):
+    logger = _get_logger()
+    try:
+        import rasterio
+
+        with rasterio.open(ndvi_path) as dataset:
+            if dataset.crs:
+                return dataset.crs
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Failed to read NDVI CRS: {exc}")
+        logger.exception("ndvi_crs_failed path=%s", ndvi_path)
+    return None
 
 
 def _coordinates_to_lists(value: Any) -> Any:
@@ -285,7 +342,10 @@ def build_map_features(
     buffer_features = []
 
     for idx, feature in enumerate(features, start=1):
-        geom = shape(feature.get("geometry"))
+        geometry = feature.get("geometry")
+        if geometry is None:
+            continue
+        geom = shape(geometry)
         wgs_geom = transform_geometry(geom, to_wgs84)
         result = results_by_id.get(idx, {})
         properties = {
@@ -318,6 +378,15 @@ def build_map_features(
             )
 
     return line_features, buffer_features
+
+
+def first_reprojected_coordinate(features: list[dict[str, Any]]) -> Sequence[float] | None:
+    for feature in features:
+        geometry = feature.get("geometry") or {}
+        for coord in iter_coordinates(geometry.get("coordinates")):
+            if coord and len(coord) >= 2:
+                return coord
+    return None
 
 
 def create_map(
@@ -462,6 +531,10 @@ def main() -> None:
     lines_payload = {}
     ndvi_overlay = None
     ndvi_crs = None
+    lines_crs = None
+
+    if ndvi_path_input and ndvi_path.exists():
+        ndvi_crs = read_ndvi_crs(ndvi_path)
 
     if enable_ndvi_overlay:
         logger.info("ndvi_overlay_enabled path=%s", ndvi_path)
@@ -477,6 +550,7 @@ def main() -> None:
             lines_payload = load_geojson(lines_path)
             lines_payload["_path"] = str(lines_path)
             logger.info("lines_loaded path=%s", lines_path)
+            lines_crs = detect_geojson_crs(lines_payload, ndvi_crs)
         except Exception as exc:  # noqa: BLE001
             st.error(f"Failed to load traction lines: {exc}")
             lines_payload = {}
@@ -487,7 +561,7 @@ def main() -> None:
     if lines_payload and (run_scoring or not (risk_path and risk_path.exists())):
         if ndvi_path.exists():
             try:
-                source_crs = detect_geojson_crs(lines_payload)
+                source_crs = lines_crs or detect_geojson_crs(lines_payload, ndvi_crs)
                 scoring_path = prepare_lines_for_scoring(lines_payload, source_crs, ndvi_crs or source_crs)
                 results = score_traction_segments(ndvi_path, scoring_path, buffer_m=buffer_m)
                 st.info("Scoring computed from NDVI and traction lines.")
@@ -512,7 +586,7 @@ def main() -> None:
 
     if lines_payload:
         try:
-            source_crs = detect_geojson_crs(lines_payload)
+            source_crs = lines_crs or detect_geojson_crs(lines_payload, ndvi_crs)
             line_features, buffer_features = build_map_features(
                 lines_payload, results_df, source_crs, ndvi_crs, buffer_m
             )
@@ -521,6 +595,19 @@ def main() -> None:
             line_features, buffer_features = [], []
     else:
         line_features, buffer_features = [], []
+
+    if lines_payload:
+        lines_crs_display = normalize_crs(lines_crs)
+        ndvi_crs_display = normalize_crs(ndvi_crs)
+        st.caption(
+            f"Detected lines CRS: {lines_crs_display.to_string() if lines_crs_display else 'unknown'}"
+        )
+        st.caption(f"NDVI CRS: {ndvi_crs_display.to_string() if ndvi_crs_display else 'unavailable'}")
+        first_coord = first_reprojected_coordinate(line_features)
+        if first_coord:
+            st.caption(f"First reprojected coordinate (lon, lat): {first_coord[0]:.6f}, {first_coord[1]:.6f}")
+        else:
+            st.caption("First reprojected coordinate (lon, lat): unavailable")
 
     map_column, table_column = st.columns([3, 2])
 
