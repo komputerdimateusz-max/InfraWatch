@@ -14,14 +14,14 @@ from urllib.request import Request, urlopen
 from .models import IngestionRequest, SceneMetadata, SceneSummary
 from .paths import as_bbox_list, select_asset_filename
 
-# Copernicus Data Space Ecosystem (CDSE) STAC API v1
+# CDSE STAC API v1
 STAC_ENDPOINT = "https://stac.dataspace.copernicus.eu/v1/search"
-# CDSE STAC collection id for Sentinel-2 Level-2A
 COLLECTION_ID = "sentinel-2-l2a"
 DOWNLOAD_TIMEOUT = 120
 
-# CDSE HTTP download gateway for EO Data (maps eodata bucket paths to HTTPS)
-CDSE_DOWNLOAD_BASE = "https://download.dataspace.copernicus.eu/"
+# CDSE Auth + OData (for downloading files via Nodes())
+IDENTITY_TOKEN_URL = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
+ODATA_BASE = "https://catalogue.dataspace.copernicus.eu/odata/v1"
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ class CopernicusAuth:
     username: str
     password: str
 
-    def header(self) -> str:
+    def basic_header(self) -> str:
         token = f"{self.username}:{self.password}".encode("utf-8")
         return "Basic " + base64.b64encode(token).decode("ascii")
 
@@ -40,13 +40,14 @@ class CopernicusClient:
     def __init__(self, auth: CopernicusAuth | None = None, endpoint: str = STAC_ENDPOINT) -> None:
         self.auth = auth
         self.endpoint = endpoint
+        self._access_token: str | None = None
 
     def has_credentials(self) -> bool:
         return self.auth is not None
 
     def search(self, request: IngestionRequest) -> tuple[list[SceneSummary], Mapping[str, Any]]:
         payload = build_search_payload(request)
-        response = post_json(self.endpoint, payload, auth=self.auth)
+        response = post_json(self.endpoint, payload, auth=None)  # STAC search works without auth
         features = response.get("features", [])
         if not features:
             raise RuntimeError("No Sentinel-2 L2A scenes found for the requested window.")
@@ -54,19 +55,159 @@ class CopernicusClient:
         sorted_scenes = sorted(scenes, key=lambda scene: (scene.acquisition_datetime, scene.product_id))
         return sorted_scenes[: request.max_scenes], payload
 
+    def _get_access_token(self) -> str:
+        if self._access_token:
+            return self._access_token
+        if not self.auth:
+            raise RuntimeError(
+                "Missing credentials. Set COPERNICUS_USERNAME and COPERNICUS_PASSWORD to enable downloads."
+            )
+        data = (
+            "client_id=cdse-public"
+            "&grant_type=password"
+            f"&username={quote(self.auth.username)}"
+            f"&password={quote(self.auth.password)}"
+        ).encode("utf-8")
+        req = Request(
+            IDENTITY_TOKEN_URL,
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        try:
+            with urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except HTTPError as exc:
+            raise RuntimeError(http_error_message(exc, IDENTITY_TOKEN_URL)) from exc
+        except URLError as exc:
+            raise RuntimeError(f"Network error while contacting {IDENTITY_TOKEN_URL}: {exc}") from exc
+
+        token = payload.get("access_token")
+        if not token:
+            raise RuntimeError("Could not obtain access token from CDSE (missing access_token in response).")
+        self._access_token = token
+        return token
+
+    def _odata_product_uuid_for_name(self, product_safe_name: str) -> str:
+        """
+        Resolve OData product UUID by Name eq '<PRODUCT>.SAFE'
+        """
+        token = self._get_access_token()
+        url = f"{ODATA_BASE}/Products?$filter=Name eq '{product_safe_name}'"
+        req = Request(url, headers={"Authorization": f"Bearer {token}"})
+        try:
+            with urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except HTTPError as exc:
+            raise RuntimeError(http_error_message(exc, url)) from exc
+        except URLError as exc:
+            raise RuntimeError(f"Network error while contacting {url}: {exc}") from exc
+
+        items = payload.get("value", [])
+        if not items:
+            raise RuntimeError(f"OData: product not found for Name='{product_safe_name}'.")
+        product_id = items[0].get("Id")
+        if not product_id:
+            raise RuntimeError("OData: product record is missing Id.")
+        return str(product_id)
+
+    def _download_via_odata_nodes(self, s3_href: str, destination_dir: Path) -> Path:
+        """
+        Convert:
+          s3://eodata/.../<PRODUCT>.SAFE/<path/to/file>
+        into:
+          /Products(<uuid>)/Nodes(<PRODUCT>.SAFE)/Nodes(...)/$value
+
+        Then download the file using Bearer token, following redirects.
+        """
+        # Parse s3 path
+        if not s3_href.startswith("s3://eodata/"):
+            raise RuntimeError(f"Expected s3://eodata/ href, got: {s3_href}")
+
+        rel = s3_href[len("s3://eodata/") :]
+        # Find "<PRODUCT>.SAFE" segment
+        parts = rel.split("/")
+        safe_idx = None
+        for i, p in enumerate(parts):
+            if p.endswith(".SAFE"):
+                safe_idx = i
+                break
+        if safe_idx is None:
+            raise RuntimeError(f"Could not locate .SAFE in s3 path: {s3_href}")
+
+        product_safe_name = parts[safe_idx]
+        inside_parts = parts[safe_idx + 1 :]
+        if not inside_parts:
+            raise RuntimeError(f"No file path inside product for: {s3_href}")
+
+        # Resolve UUID and build Nodes URL
+        product_uuid = self._odata_product_uuid_for_name(product_safe_name)
+
+        # Build Nodes(...) chain; quote each node but keep parentheses and slashes safe
+        def node(seg: str) -> str:
+            # Encode special characters safely for URL path segment
+            return f"Nodes({quote(seg, safe='-_.()')})"
+
+        nodes_chain = "/".join([node(product_safe_name)] + [node(p) for p in inside_parts])
+        url = f"{ODATA_BASE}/Products({product_uuid})/{nodes_chain}/$value"
+
+        # Download (handle redirects manually to preserve Authorization until final URL)
+        token = self._get_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        filename = inside_parts[-1]
+        output_path = destination_dir / filename
+
+        logger.info("Downloading via OData Nodes -> %s", output_path)
+
+        try:
+            current = url
+            for _ in range(10):
+                req = Request(current, headers=headers)
+                try:
+                    resp = urlopen(req, timeout=DOWNLOAD_TIMEOUT)
+                except HTTPError as exc:
+                    # Handle redirects via HTTPError for some urllib handlers
+                    if exc.code in (301, 302, 303, 307, 308) and exc.headers.get("Location"):
+                        current = exc.headers["Location"]
+                        continue
+                    raise
+                # If we got here, it's a 200-like response
+                with resp:
+                    with output_path.open("wb") as handle:
+                        while True:
+                            chunk = resp.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            handle.write(chunk)
+                return output_path
+
+            raise RuntimeError("Too many redirects while downloading via OData Nodes().")
+        except HTTPError as exc:
+            raise RuntimeError(http_error_message(exc, current)) from exc
+        except URLError as exc:
+            raise RuntimeError(f"Network error while downloading {current}: {exc}") from exc
+
     def download_scene(self, scene: SceneSummary, destination_dir: Path) -> Path:
+        """
+        MVP behaviour:
+        - If scene.download_url is s3://eodata/... -> download file via OData Nodes() using Bearer token
+        - Otherwise download directly via HTTPS with Basic Auth (fallback)
+        """
+        if scene.download_url.startswith("s3://eodata/"):
+            return self._download_via_odata_nodes(scene.download_url, destination_dir)
+
+        # Fallback: direct HTTPS (rare for CDSE STAC, but kept for robustness)
         destination_dir.mkdir(parents=True, exist_ok=True)
         filename = select_asset_filename(scene.download_url, f"{scene.product_id}.bin")
         output_path = destination_dir / filename
 
         logger.info("Downloading %s -> %s", scene.product_id, output_path)
-
         headers: dict[str, str] = {}
         if self.auth:
-            headers["Authorization"] = self.auth.header()
+            headers["Authorization"] = self.auth.basic_header()
 
         request = Request(scene.download_url, headers=headers)
-
         try:
             with urlopen(request, timeout=DOWNLOAD_TIMEOUT) as response:
                 with output_path.open("wb") as handle:
@@ -100,7 +241,7 @@ def post_json(endpoint: str, payload: Mapping[str, Any], auth: CopernicusAuth | 
     data = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if auth:
-        headers["Authorization"] = auth.header()
+        headers["Authorization"] = auth.basic_header()
     request = Request(endpoint, data=data, headers=headers)
     try:
         with urlopen(request, timeout=DOWNLOAD_TIMEOUT) as response:
@@ -126,8 +267,7 @@ def scene_from_feature(feature: Mapping[str, Any]) -> SceneSummary:
     if len(bbox) != 4:
         raise RuntimeError("Scene is missing a valid bbox.")
 
-    raw_url = select_download_url(feature.get("assets", {}))
-    download_url = normalize_download_url(raw_url)
+    download_url = select_download_url(feature.get("assets", {}))
 
     return SceneSummary(
         product_id=product_id,
@@ -149,25 +289,6 @@ def select_download_url(assets: Mapping[str, Any]) -> str:
         if isinstance(asset, Mapping) and "href" in asset:
             return asset["href"]
     raise RuntimeError("No downloadable asset found in STAC item.")
-
-
-def normalize_download_url(href: str) -> str:
-    """
-    CDSE STAC often returns S3 hrefs, e.g.:
-      s3://eodata/Sentinel-2/.../T33UWU_..._AOT_10m.jp2
-
-    urllib cannot handle s3://. For MVP we map eodata bucket paths to the CDSE HTTPS gateway:
-      https://download.dataspace.copernicus.eu/Sentinel-2/.../file.jp2
-
-    This keeps dependencies minimal (no boto3). If CDSE changes gateway rules, this function is
-    the single place to update.
-    """
-    if href.startswith("s3://eodata/"):
-        rel = href[len("s3://eodata/") :]
-        # ensure URL-safe path (keep slashes)
-        rel_q = quote(rel, safe="/")
-        return CDSE_DOWNLOAD_BASE + rel_q
-    return href
 
 
 def parse_datetime(value: str) -> datetime:
