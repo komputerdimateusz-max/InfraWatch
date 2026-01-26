@@ -165,7 +165,10 @@ def prepare_lines_for_scoring(
     from shapely.geometry import mapping, shape
 
     if source_crs == target_crs:
-        return Path(lines_payload["_path"])
+        existing_path = lines_payload.get("_path")
+        if existing_path:
+            return Path(existing_path)
+        return _write_temp_geojson(lines_payload)
 
     transformer = to_crs_transformer(source_crs, target_crs)
     transformed_features = []
@@ -183,10 +186,7 @@ def prepare_lines_for_scoring(
         "type": "FeatureCollection",
         "features": transformed_features,
     }
-    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".geojson")
-    temp.write(json.dumps(transformed_payload).encode("utf-8"))
-    temp.close()
-    return Path(temp.name)
+    return _write_temp_geojson(transformed_payload)
 
 
 def load_ndvi_overlay(ndvi_path: Path) -> tuple[str, list[list[float]], Any] | None:
@@ -370,6 +370,45 @@ def bounds_from_features(features: list[dict[str, Any]]) -> list[list[float]] | 
     return [[min(lons), min(lats)], [max(lons), max(lats)]]
 
 
+def bounds_from_feature_collection(payload: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    from shapely.geometry import shape
+
+    bounds: tuple[float, float, float, float] | None = None
+    for feature in payload.get("features", []):
+        geometry = feature.get("geometry")
+        if not geometry:
+            continue
+        geom = shape(geometry)
+        if geom.is_empty:
+            continue
+        if bounds is None:
+            bounds = geom.bounds
+        else:
+            minx, miny, maxx, maxy = bounds
+            geom_bounds = geom.bounds
+            bounds = (
+                min(minx, geom_bounds[0]),
+                min(miny, geom_bounds[1]),
+                max(maxx, geom_bounds[2]),
+                max(maxy, geom_bounds[3]),
+            )
+    return bounds
+
+
+def bounds_overlap(
+    bounds: tuple[float, float, float, float] | None,
+    other: tuple[float, float, float, float] | None,
+) -> bool:
+    if not bounds or not other:
+        return False
+    return not (
+        bounds[2] <= other[0]
+        or bounds[0] >= other[2]
+        or bounds[3] <= other[1]
+        or bounds[1] >= other[3]
+    )
+
+
 def bounds_to_folium(bounds_lon_lat: list[list[float]] | None) -> list[list[float]] | None:
     if not bounds_lon_lat:
         return None
@@ -421,7 +460,7 @@ def build_map_features(
     if not results_df.empty and "segment_id" in results_df.columns:
         results_by_id = results_df.set_index("segment_id").to_dict(orient="index")
 
-    map_source_crs = ndvi_crs or source_crs
+    map_source_crs = source_crs
     to_wgs84 = to_crs_transformer(map_source_crs, CRS.from_epsg(4326))
     to_ndvi = to_crs_transformer(source_crs, ndvi_crs) if ndvi_crs else None
     ndvi_to_wgs84 = to_crs_transformer(ndvi_crs, CRS.from_epsg(4326)) if ndvi_crs else None
@@ -573,22 +612,83 @@ def _build_line_feature(
     }
 
 
-def _drawings_to_feature_collection(drawings: list[dict[str, Any]]) -> dict[str, Any]:
+def _line_geometry_types() -> tuple[str, ...]:
+    return ("LineString", "MultiLineString")
+
+
+def _coerce_features_from_drawing(drawing: dict[str, Any]) -> list[dict[str, Any]]:
+    if drawing.get("type") == "FeatureCollection":
+        return list(drawing.get("features", []))
+    if drawing.get("type") == "Feature":
+        return [drawing]
+    if "geometry" in drawing:
+        return [{"type": "Feature", "geometry": drawing.get("geometry"), "properties": drawing.get("properties", {})}]
+    if drawing.get("type") in _line_geometry_types():
+        return [{"type": "Feature", "geometry": drawing, "properties": {}}]
+    return []
+
+
+def normalize_drawings_to_featurecollection(map_output: dict[str, Any] | None) -> dict[str, Any]:
+    drawings = _extract_drawings(map_output)
     features: list[dict[str, Any]] = []
     segment_id = 1
     for drawing in drawings:
-        geometry = drawing.get("geometry")
-        if not geometry or geometry.get("type") != "LineString":
+        for feature in _coerce_features_from_drawing(drawing):
+            geometry = feature.get("geometry") or {}
+            if geometry.get("type") not in _line_geometry_types():
+                continue
+            features.append(
+                _build_line_feature(
+                    normalize_geojson_coordinates(geometry),
+                    segment_id,
+                    f"drawn-{segment_id}",
+                )
+            )
+            segment_id += 1
+    return _build_line_feature_collection(features)
+
+
+def merge_lines(
+    existing_fc: dict[str, Any] | None, new_fc: dict[str, Any] | None
+) -> dict[str, Any]:
+    existing_features = list((existing_fc or {}).get("features", []))
+    new_features = list((new_fc or {}).get("features", []))
+    merged: list[dict[str, Any]] = []
+    segment_id = 1
+    for feature in existing_features + new_features:
+        geometry = feature.get("geometry") or {}
+        if geometry.get("type") not in _line_geometry_types():
             continue
-        features.append(
+        merged.append(
             _build_line_feature(
                 normalize_geojson_coordinates(geometry),
                 segment_id,
-                f"drawn-{segment_id}",
+                feature.get("properties", {}).get("feature_id", f"drawn-{segment_id}"),
             )
         )
         segment_id += 1
-    return _build_line_feature_collection(features)
+    return _build_line_feature_collection(merged)
+
+
+def transform_featurecollection(payload: dict[str, Any], source_crs, target_crs) -> dict[str, Any]:
+    from shapely.geometry import mapping, shape
+
+    if source_crs == target_crs:
+        return payload
+    transformer = to_crs_transformer(source_crs, target_crs)
+    if transformer is None:
+        return payload
+    transformed_features = []
+    for feature in payload.get("features", []):
+        geometry = feature.get("geometry")
+        if not geometry:
+            continue
+        geom = shape(geometry)
+        projected = transform_geometry(geom, transformer)
+        transformed_feature = dict(feature)
+        transformed_feature["geometry"] = mapping(projected)
+        transformed_features.append(transformed_feature)
+    return {"type": "FeatureCollection", "features": transformed_features}
 
 
 def _extract_drawings(map_output: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -652,14 +752,20 @@ def create_map(
     opacity: float,
     fit_bounds: list[list[float]] | None,
     enable_drawing: bool,
+    map_center: dict[str, float] | None,
+    map_zoom: int | float | None,
 ) -> folium.Map:
-    if fit_bounds:
+    if map_center:
+        center_lat = map_center.get("lat", 0)
+        center_lon = map_center.get("lng", 0)
+    elif fit_bounds:
         center_lat = (fit_bounds[0][1] + fit_bounds[1][1]) / 2
         center_lon = (fit_bounds[0][0] + fit_bounds[1][0]) / 2
     else:
         center_lat, center_lon = 0, 0
 
-    fmap = folium.Map(location=[center_lat, center_lon], zoom_start=10, control_scale=True)
+    zoom_start = map_zoom if map_zoom is not None else 10
+    fmap = folium.Map(location=[center_lat, center_lon], zoom_start=zoom_start, control_scale=True)
 
     if ndvi_overlay:
         image, bounds, _ = ndvi_overlay
@@ -742,7 +848,7 @@ def create_map(
         ).add_to(fmap)
 
     folium.LayerControl(collapsed=False).add_to(fmap)
-    if fit_bounds:
+    if fit_bounds and not map_center:
         fmap.fit_bounds(bounds_to_folium(fit_bounds))
     return fmap
 
@@ -769,6 +875,8 @@ def main() -> None:
 
     if "lines_path" not in st.session_state:
         st.session_state["lines_path"] = lines_default
+    if "drawn_lines_fc_wgs84" not in st.session_state:
+        st.session_state["drawn_lines_fc_wgs84"] = {}
 
     with st.sidebar:
         st.header("Inputs")
@@ -796,6 +904,10 @@ def main() -> None:
             options=["From file", "Draw on map", "Paste coordinates"],
             index=0,
         )
+        if traction_mode == "Draw on map":
+            if st.button("Clear drawn lines"):
+                st.session_state["drawn_lines_fc_wgs84"] = {}
+                st.session_state.pop("drawn_lines_path", None)
         lines_path_input = st.text_input("Traction lines GeoJSON path", key="lines_path")
         coordinate_format = None
         coordinate_text = None
@@ -857,10 +969,10 @@ def main() -> None:
             st.error("Traction lines GeoJSON not found.")
     elif traction_mode == "Draw on map":
         # Read previously drawn segments captured from the folium draw tool.
-        drawings = st.session_state.get("drawn_line_features", {})
+        drawings = st.session_state.get("drawn_lines_fc_wgs84", {})
         if drawings:
             lines_payload = dict(drawings)
-            lines_payload["_path"] = st.session_state.get("drawn_line_path", "")
+            lines_payload["_path"] = st.session_state.get("drawn_lines_path", "")
             lines_crs = normalize_crs("EPSG:4326")
         else:
             lines_warning = "Draw at least one line to score."
@@ -916,18 +1028,41 @@ def main() -> None:
             st.info(
                 "NDVI returned NO_DATA for one or more segments. Check segment overlap and CRS if needed."
             )
-        if no_data_mask.any() and show_debug and ndvi_bounds is not None:
-            debug_payload: dict[str, Any] = {
-                "ndvi_bounds_native": {
-                    "left": ndvi_bounds.left,
-                    "bottom": ndvi_bounds.bottom,
-                    "right": ndvi_bounds.right,
-                    "top": ndvi_bounds.top,
-                },
-                "ndvi_bounds_wgs84": ndvi_bounds_wgs84,
+
+    if show_debug:
+        debug_payload: dict[str, Any] = {}
+        if ndvi_bounds is not None:
+            debug_payload["ndvi_bounds_native"] = {
+                "left": ndvi_bounds.left,
+                "bottom": ndvi_bounds.bottom,
+                "right": ndvi_bounds.right,
+                "top": ndvi_bounds.top,
             }
-            if lines_payload and ndvi_path.exists():
-                source_crs = lines_crs or detect_geojson_crs(lines_payload, ndvi_crs)
+        if ndvi_bounds_wgs84 is not None:
+            debug_payload["ndvi_bounds_wgs84"] = ndvi_bounds_wgs84
+        if traction_mode == "Draw on map":
+            stored = st.session_state.get("drawn_lines_fc_wgs84", {})
+            stored_features = stored.get("features", [])
+            debug_payload["stored_drawn_count"] = len(stored_features)
+            debug_payload["stored_drawn_types"] = [
+                (feature.get("geometry") or {}).get("type") for feature in stored_features
+            ]
+        if lines_payload:
+            source_crs = lines_crs or detect_geojson_crs(lines_payload, ndvi_crs)
+            debug_payload["lines_source_crs"] = source_crs.to_string() if source_crs else "unknown"
+            if ndvi_crs:
+                transformed = transform_featurecollection(lines_payload, source_crs, ndvi_crs)
+                line_bounds = bounds_from_feature_collection(transformed)
+                debug_payload["line_bounds_native"] = line_bounds
+                if ndvi_bounds is not None:
+                    ndvi_bounds_tuple = (
+                        ndvi_bounds.left,
+                        ndvi_bounds.bottom,
+                        ndvi_bounds.right,
+                        ndvi_bounds.top,
+                    )
+                    debug_payload["line_overlaps_ndvi"] = bounds_overlap(line_bounds, ndvi_bounds_tuple)
+            if ndvi_path.exists():
                 from shapely.geometry import shape
 
                 first_feature = next(
@@ -944,7 +1079,7 @@ def main() -> None:
                     debug_payload["sample_line_stats"] = sample_stats
                     debug_payload["sample_buffer_m"] = buffer_m
                     debug_payload["sample_geom_type"] = geom.geom_type
-            st.code(json.dumps(debug_payload, indent=2))
+        st.code(json.dumps(debug_payload, indent=2))
 
     if lines_warning:
         st.warning(lines_warning)
@@ -1002,16 +1137,35 @@ def main() -> None:
                 opacity=opacity,
                 fit_bounds=fit_bounds,
                 enable_drawing=traction_mode == "Draw on map",
+                map_center=st.session_state.get("map_center"),
+                map_zoom=st.session_state.get("map_zoom"),
             )
             map_output = st_folium(fmap, width=800, height=600, key="traction_map")
+            if map_output:
+                center = map_output.get("center")
+                zoom = map_output.get("zoom")
+                if isinstance(center, dict) and "lat" in center and "lng" in center:
+                    st.session_state["map_center"] = center
+                if isinstance(zoom, (int, float)):
+                    st.session_state["map_zoom"] = zoom
             if traction_mode == "Draw on map":
-                # Capture drawn lines so they are available on the next rerun (e.g., when scoring).
-                drawings = _extract_drawings(map_output)
-                if drawings:
-                    new_payload = _drawings_to_feature_collection(drawings)
-                    if new_payload.get("features"):
-                        st.session_state["drawn_line_features"] = new_payload
-                        st.session_state["drawn_line_path"] = str(_write_temp_geojson(new_payload))
+                # Capture drawn lines so they persist across reruns (debug toggles, sliders, etc.).
+                if map_output and ("all_drawings" in map_output or "last_active_drawing" in map_output):
+                    new_payload = normalize_drawings_to_featurecollection(map_output)
+                    if "all_drawings" in map_output:
+                        updated_payload = new_payload
+                    else:
+                        updated_payload = merge_lines(
+                            st.session_state.get("drawn_lines_fc_wgs84"), new_payload
+                        )
+                    if updated_payload.get("features"):
+                        st.session_state["drawn_lines_fc_wgs84"] = updated_payload
+                        st.session_state["drawn_lines_path"] = str(
+                            _write_temp_geojson(updated_payload)
+                        )
+                    elif "all_drawings" in map_output:
+                        st.session_state["drawn_lines_fc_wgs84"] = {}
+                        st.session_state.pop("drawn_lines_path", None)
         except Exception as exc:  # noqa: BLE001
             st.error(f"Failed to render map: {exc}")
 
