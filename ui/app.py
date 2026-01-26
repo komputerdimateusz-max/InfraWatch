@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import re
 import tempfile
 from dataclasses import dataclass
@@ -21,16 +22,8 @@ from typing import Any, Iterable, Sequence
 import folium
 import numpy as np
 import pandas as pd
-import rasterio
 import streamlit as st
 from folium.features import GeoJsonTooltip
-from pyproj import Transformer
-from rasterio.crs import CRS
-from rasterio.enums import Resampling
-from rasterio.transform import Affine, array_bounds
-from rasterio.warp import transform_bounds
-from shapely.geometry import mapping, shape
-from shapely.ops import transform as shapely_transform
 from streamlit_folium import st_folium
 
 from infrawatch.scoring import score_traction_segments
@@ -44,6 +37,21 @@ class NdviDetection:
 
 
 DATE_PATTERN = re.compile(r"(20\d{6})")
+LOG_PATH = Path("ui_runtime.log")
+
+
+def _get_logger() -> logging.Logger:
+    logger = logging.getLogger("ui_runtime")
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+    handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.propagate = False
+    return logger
 
 
 def _parse_scene_date(path: Path) -> datetime | None:
@@ -97,7 +105,9 @@ def load_geojson(path: Path) -> dict[str, Any]:
     return {"type": "FeatureCollection", "features": [{"type": "Feature", "geometry": payload, "properties": {}}]}
 
 
-def detect_geojson_crs(payload: dict[str, Any]) -> CRS:
+def detect_geojson_crs(payload: dict[str, Any]):
+    from pyproj import CRS
+
     crs_payload = payload.get("crs")
     if isinstance(crs_payload, dict):
         props = crs_payload.get("properties") or {}
@@ -107,7 +117,9 @@ def detect_geojson_crs(payload: dict[str, Any]) -> CRS:
     return CRS.from_epsg(4326)
 
 
-def to_crs_transformer(source: CRS, target: CRS):
+def to_crs_transformer(source, target):
+    from pyproj import Transformer
+
     if source == target:
         return None
 
@@ -115,14 +127,18 @@ def to_crs_transformer(source: CRS, target: CRS):
 
 
 def transform_geometry(geom, transformer) -> Any:
+    from shapely.ops import transform as shapely_transform
+
     if transformer is None:
         return geom
     return shapely_transform(transformer.transform, geom)
 
 
 def prepare_lines_for_scoring(
-    lines_payload: dict[str, Any], source_crs: CRS, target_crs: CRS
+    lines_payload: dict[str, Any], source_crs, target_crs
 ) -> Path:
+    from shapely.geometry import mapping, shape
+
     if source_crs == target_crs:
         return Path(lines_payload["_path"])
 
@@ -145,48 +161,54 @@ def prepare_lines_for_scoring(
     return Path(temp.name)
 
 
-def load_ndvi_preview(
-    ndvi_path: Path, max_size: int = 1024
-) -> tuple[np.ndarray, tuple[float, float, float, float], Affine, CRS]:
-    with rasterio.open(ndvi_path) as dataset:
-        scale = min(1.0, max_size / max(dataset.width, dataset.height))
-        new_width = max(1, int(dataset.width * scale))
-        new_height = max(1, int(dataset.height * scale))
+def load_ndvi_overlay(ndvi_path: Path) -> tuple[str, list[list[float]], Any] | None:
+    logger = _get_logger()
+    try:
+        import rasterio
+        from matplotlib import pyplot as plt
+        from rasterio.enums import Resampling
+        from rasterio.transform import Affine, array_bounds
+        from rasterio.warp import transform_bounds
+        from rasterio.crs import CRS
 
-        preview = dataset.read(
-            1,
-            out_shape=(new_height, new_width),
-            resampling=Resampling.bilinear,
-            masked=True,
-        ).astype(np.float32)
-        if dataset.nodata is not None:
-            preview = np.ma.masked_where(preview == dataset.nodata, preview)
-        preview = np.ma.masked_invalid(preview)
+        with rasterio.open(ndvi_path) as dataset:
+            scale = min(1.0, 1024 / max(dataset.width, dataset.height))
+            new_width = max(1, int(dataset.width * scale))
+            new_height = max(1, int(dataset.height * scale))
 
-        scale_x = dataset.width / new_width
-        scale_y = dataset.height / new_height
-        preview_transform = dataset.transform * Affine.scale(scale_x, scale_y)
-        south, west, north, east = array_bounds(new_height, new_width, preview_transform)
-        bounds = (west, south, east, north)
-        return preview, bounds, preview_transform, dataset.crs
+            preview = dataset.read(
+                1,
+                out_shape=(new_height, new_width),
+                resampling=Resampling.bilinear,
+                masked=True,
+            ).astype(np.float32)
+            if dataset.nodata is not None:
+                preview = np.ma.masked_where(preview == dataset.nodata, preview)
+            preview = np.ma.masked_invalid(preview)
 
+            scale_x = dataset.width / new_width
+            scale_y = dataset.height / new_height
+            preview_transform = dataset.transform * Affine.scale(scale_x, scale_y)
+            south, west, north, east = array_bounds(new_height, new_width, preview_transform)
+            bounds = (west, south, east, north)
+            ndvi_crs = dataset.crs
 
-def load_ndvi_overlay(ndvi_path: Path) -> tuple[str, list[list[float]], CRS]:
-    preview, bounds, _, ndvi_crs = load_ndvi_preview(ndvi_path)
+        colormap = plt.get_cmap("viridis").copy()
+        colormap.set_bad(alpha=0)
+        buf = io.BytesIO()
+        plt.imsave(buf, preview, cmap=colormap, format="png")
+        buf.seek(0)
+        encoded = base64.b64encode(buf.read()).decode("ascii")
+        data_url = f"data:image/png;base64,{encoded}"
 
-    from matplotlib import pyplot as plt
-
-    colormap = plt.get_cmap("viridis").copy()
-    colormap.set_bad(alpha=0)
-    buf = io.BytesIO()
-    plt.imsave(buf, preview, cmap=colormap, format="png")
-    buf.seek(0)
-    encoded = base64.b64encode(buf.read()).decode("ascii")
-    data_url = f"data:image/png;base64,{encoded}"
-
-    wgs_bounds = transform_bounds(ndvi_crs, CRS.from_epsg(4326), *bounds)
-    bounds_list = [[wgs_bounds[1], wgs_bounds[0]], [wgs_bounds[3], wgs_bounds[2]]]
-    return data_url, bounds_list, ndvi_crs
+        wgs_bounds = transform_bounds(ndvi_crs, CRS.from_epsg(4326), *bounds)
+        bounds_list = [[wgs_bounds[1], wgs_bounds[0]], [wgs_bounds[3], wgs_bounds[2]]]
+        logger.info("ndvi_overlay_loaded path=%s", ndvi_path)
+        return data_url, bounds_list, ndvi_crs
+    except Exception as exc:  # noqa: BLE001
+        st.exception(exc)
+        logger.exception("ndvi_overlay_failed path=%s", ndvi_path)
+        return None
 
 
 def _coordinates_to_lists(value: Any) -> Any:
@@ -242,10 +264,13 @@ def build_results_table(results: list[dict[str, Any]]) -> pd.DataFrame:
 def build_map_features(
     lines_payload: dict[str, Any],
     results_df: pd.DataFrame,
-    source_crs: CRS,
-    ndvi_crs: CRS | None,
+    source_crs,
+    ndvi_crs,
     buffer_m: float,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    from pyproj import CRS
+    from shapely.geometry import mapping, shape
+
     features = lines_payload.get("features", [])
     results_by_id = {}
     if not results_df.empty and "segment_id" in results_df.columns:
@@ -395,6 +420,10 @@ def create_map(
 def main() -> None:
     st.set_page_config(page_title="InfraWatch MVP", layout="wide")
     st.title("InfraWatch — Traction Vegetation Risk")
+    st.info("UI heartbeat: Streamlit app is running.")
+
+    logger = _get_logger()
+    logger.info("ui_start")
 
     base_dir = Path("satellite_data/raw/s2")
     ndvi_detection = NdviDetection(path=None, scene_date=None, scene_folder=None)
@@ -410,6 +439,7 @@ def main() -> None:
     with st.sidebar:
         st.header("Inputs")
         ndvi_path_input = st.text_input("NDVI GeoTIFF path", value=ndvi_default)
+        enable_ndvi_overlay = st.checkbox("Enable NDVI overlay (experimental)", value=False)
         if ndvi_detection.path:
             st.caption(f"Scene date: {ndvi_detection.scene_date}")
             st.caption(f"Scene folder: {ndvi_detection.scene_folder}")
@@ -433,17 +463,20 @@ def main() -> None:
     ndvi_overlay = None
     ndvi_crs = None
 
-    if ndvi_path_input and ndvi_path.exists():
-        try:
+    if enable_ndvi_overlay:
+        logger.info("ndvi_overlay_enabled path=%s", ndvi_path)
+        if ndvi_path_input and ndvi_path.exists():
             ndvi_overlay = load_ndvi_overlay(ndvi_path)
-            ndvi_crs = ndvi_overlay[2]
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Failed to load NDVI: {exc}")
+            if ndvi_overlay:
+                ndvi_crs = ndvi_overlay[2]
+        else:
+            st.warning("NDVI path not found; overlay disabled.")
 
     if lines_path.exists():
         try:
             lines_payload = load_geojson(lines_path)
             lines_payload["_path"] = str(lines_path)
+            logger.info("lines_loaded path=%s", lines_path)
         except Exception as exc:  # noqa: BLE001
             st.error(f"Failed to load traction lines: {exc}")
             lines_payload = {}
@@ -458,6 +491,7 @@ def main() -> None:
                 scoring_path = prepare_lines_for_scoring(lines_payload, source_crs, ndvi_crs or source_crs)
                 results = score_traction_segments(ndvi_path, scoring_path, buffer_m=buffer_m)
                 st.info("Scoring computed from NDVI and traction lines.")
+                logger.info("scoring_computed ndvi=%s lines=%s", ndvi_path, scoring_path)
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Scoring failed: {exc}")
         else:
@@ -466,6 +500,7 @@ def main() -> None:
         try:
             results = json.loads(risk_path.read_text(encoding="utf-8"))
             st.info(f"Loaded risk results from {risk_path}")
+            logger.info("risk_results_loaded path=%s", risk_path)
         except Exception as exc:  # noqa: BLE001
             st.error(f"Failed to load risk JSON: {exc}")
 
