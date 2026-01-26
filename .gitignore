@@ -9,3 +9,14 @@ git/
 main/
 python/
 trash/
+
+# runtime outputs
+*.json
+*.tif
+*.jp2
+
+# accidental console artifacts
+cd
+dir
+python
+np.ndarray*
