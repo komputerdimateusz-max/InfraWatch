@@ -1,0 +1,29 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "segment-1",
+      "properties": {"name": "Demo Segment 1"},
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [500000.0, 5100000.0],
+          [500100.0, 5100100.0]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "segment-2",
+      "properties": {"name": "Demo Segment 2"},
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [500200.0, 5100200.0],
+          [500300.0, 5100300.0]
+        ]
+      }
+    }
+  ]
+}
