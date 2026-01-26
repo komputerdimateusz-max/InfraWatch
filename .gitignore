@@ -5,3 +5,7 @@ satellite_data/
 outputs/
 reports/
 .streamlit/
+git/
+main/
+python/
+trash/
