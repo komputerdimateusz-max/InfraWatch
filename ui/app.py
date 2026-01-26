@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from folium.features import GeoJsonTooltip
+from folium.plugins import Draw
 from streamlit_folium import st_folium
 
 from infrawatch.scoring import score_traction_segments
@@ -546,6 +547,103 @@ def build_feature_collection(features: list[dict[str, Any]]) -> dict[str, Any]:
     return {"type": "FeatureCollection", "features": features}
 
 
+def _write_temp_geojson(payload: dict[str, Any]) -> Path:
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".geojson")
+    temp.write(json.dumps(payload).encode("utf-8"))
+    temp.close()
+    return Path(temp.name)
+
+
+def _build_line_feature_collection(features: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"type": "FeatureCollection", "features": features}
+
+
+def _build_line_feature(
+    geometry: dict[str, Any],
+    segment_id: int,
+    feature_id: str,
+) -> dict[str, Any]:
+    return {
+        "type": "Feature",
+        "geometry": geometry,
+        "properties": {
+            "segment_id": segment_id,
+            "feature_id": feature_id,
+        },
+    }
+
+
+def _drawings_to_feature_collection(drawings: list[dict[str, Any]]) -> dict[str, Any]:
+    features: list[dict[str, Any]] = []
+    segment_id = 1
+    for drawing in drawings:
+        geometry = drawing.get("geometry")
+        if not geometry or geometry.get("type") != "LineString":
+            continue
+        features.append(
+            _build_line_feature(
+                normalize_geojson_coordinates(geometry),
+                segment_id,
+                f"drawn-{segment_id}",
+            )
+        )
+        segment_id += 1
+    return _build_line_feature_collection(features)
+
+
+def _extract_drawings(map_output: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not map_output:
+        return []
+    drawings = map_output.get("all_drawings")
+    if isinstance(drawings, list):
+        return drawings
+    last_drawing = map_output.get("last_active_drawing")
+    if isinstance(last_drawing, dict):
+        return [last_drawing]
+    return []
+
+
+def _parse_coordinate_line(text: str) -> Sequence[float] | None:
+    parts = [item.strip() for item in text.split(",") if item.strip()]
+    if len(parts) < 2:
+        return None
+    try:
+        return [float(parts[0]), float(parts[1])]
+    except ValueError:
+        return None
+
+
+def _parse_coordinate_blocks(text: str) -> list[list[Sequence[float]]]:
+    blocks: list[list[Sequence[float]]] = []
+    current: list[Sequence[float]] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if current:
+                blocks.append(current)
+                current = []
+            continue
+        coord = _parse_coordinate_line(line)
+        if coord is None:
+            continue
+        current.append(coord)
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def _coordinates_to_feature_collection(
+    blocks: list[list[Sequence[float]]], feature_prefix: str
+) -> dict[str, Any]:
+    features: list[dict[str, Any]] = []
+    for idx, points in enumerate(blocks, start=1):
+        if len(points) < 2:
+            continue
+        geometry = {"type": "LineString", "coordinates": points}
+        features.append(_build_line_feature(geometry, idx, f"{feature_prefix}-{idx}"))
+    return _build_line_feature_collection(features)
+
+
 def create_map(
     ndvi_overlay: tuple[str, list[list[float]], CRS] | None,
     line_features: list[dict[str, Any]],
@@ -553,6 +651,7 @@ def create_map(
     show_buffers: bool,
     opacity: float,
     fit_bounds: list[list[float]] | None,
+    enable_drawing: bool,
 ) -> folium.Map:
     if fit_bounds:
         center_lat = (fit_bounds[0][1] + fit_bounds[1][1]) / 2
@@ -629,6 +728,19 @@ def create_map(
             },
         ).add_to(fmap)
 
+    if enable_drawing:
+        Draw(
+            draw_options={
+                "polyline": True,
+                "polygon": False,
+                "rectangle": False,
+                "circle": False,
+                "marker": False,
+                "circlemarker": False,
+            },
+            edit_options={"edit": True, "remove": True},
+        ).add_to(fmap)
+
     folium.LayerControl(collapsed=False).add_to(fmap)
     if fit_bounds:
         fmap.fit_bounds(bounds_to_folium(fit_bounds))
@@ -679,7 +791,25 @@ def main() -> None:
                     st.success(f"Generated demo segment at {generated}")
             else:
                 st.warning("NDVI path not found; unable to generate demo segment.")
+        traction_mode = st.selectbox(
+            "Traction input mode",
+            options=["From file", "Draw on map", "Paste coordinates"],
+            index=0,
+        )
         lines_path_input = st.text_input("Traction lines GeoJSON path", key="lines_path")
+        coordinate_format = None
+        coordinate_text = None
+        if traction_mode == "Paste coordinates":
+            coordinate_format = st.selectbox(
+                "Coordinate format",
+                options=["WGS84 (lon,lat)", f"EPSG:{DEFAULT_UTM_EPSG} (x,y)"],
+                index=0,
+            )
+            coordinate_text = st.text_area(
+                "Segment coordinates (one point per line, blank line separates segments)",
+                placeholder="lon,lat\nlon,lat\n\nlon,lat\nlon,lat",
+                height=160,
+            )
         risk_path_input = st.text_input("Risk JSON path", value=risk_default)
         buffer_m = st.slider("Buffer distance (meters)", min_value=1, max_value=100, value=20)
         opacity = st.slider("NDVI overlay opacity", min_value=0.1, max_value=1.0, value=0.6)
@@ -692,6 +822,7 @@ def main() -> None:
     risk_path = Path(risk_path_input).expanduser() if risk_path_input else None
 
     lines_payload = {}
+    lines_warning = None
     ndvi_overlay = None
     ndvi_crs = None
     lines_crs = None
@@ -712,17 +843,40 @@ def main() -> None:
         else:
             st.warning("NDVI path not found; overlay disabled.")
 
-    if lines_path.exists():
-        try:
-            lines_payload = load_geojson(lines_path)
-            lines_payload["_path"] = str(lines_path)
-            logger.info("lines_loaded path=%s", lines_path)
-            lines_crs = detect_geojson_crs(lines_payload, ndvi_crs)
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Failed to load traction lines: {exc}")
-            lines_payload = {}
-    else:
-        st.error("Traction lines GeoJSON not found.")
+    if traction_mode == "From file":
+        if lines_path.exists():
+            try:
+                lines_payload = load_geojson(lines_path)
+                lines_payload["_path"] = str(lines_path)
+                logger.info("lines_loaded path=%s", lines_path)
+                lines_crs = detect_geojson_crs(lines_payload, ndvi_crs)
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Failed to load traction lines: {exc}")
+                lines_payload = {}
+        else:
+            st.error("Traction lines GeoJSON not found.")
+    elif traction_mode == "Draw on map":
+        # Read previously drawn segments captured from the folium draw tool.
+        drawings = st.session_state.get("drawn_line_features", {})
+        if drawings:
+            lines_payload = dict(drawings)
+            lines_payload["_path"] = st.session_state.get("drawn_line_path", "")
+            lines_crs = normalize_crs("EPSG:4326")
+        else:
+            lines_warning = "Draw at least one line to score."
+    elif traction_mode == "Paste coordinates":
+        if coordinate_text:
+            blocks = _parse_coordinate_blocks(coordinate_text)
+            payload = _coordinates_to_feature_collection(blocks, "pasted")
+            if payload.get("features"):
+                lines_payload = payload
+                lines_payload["_path"] = str(_write_temp_geojson(lines_payload))
+                # Use the selected CRS so scoring can reproject into the NDVI CRS.
+                lines_crs = normalize_crs("EPSG:4326" if "WGS84" in (coordinate_format or "") else DEFAULT_UTM_EPSG)
+            else:
+                lines_warning = "Enter at least one segment with two points."
+        else:
+            lines_warning = "Paste coordinate lines to define a segment."
 
     results: list[dict[str, Any]] = []
     if lines_payload and (run_scoring or not (risk_path and risk_path.exists())):
@@ -792,6 +946,9 @@ def main() -> None:
                     debug_payload["sample_geom_type"] = geom.geom_type
             st.code(json.dumps(debug_payload, indent=2))
 
+    if lines_warning:
+        st.warning(lines_warning)
+
     if lines_payload:
         try:
             source_crs = lines_crs or detect_geojson_crs(lines_payload, ndvi_crs)
@@ -844,8 +1001,17 @@ def main() -> None:
                 show_buffers=show_buffers,
                 opacity=opacity,
                 fit_bounds=fit_bounds,
+                enable_drawing=traction_mode == "Draw on map",
             )
-            st_folium(fmap, width=800, height=600)
+            map_output = st_folium(fmap, width=800, height=600, key="traction_map")
+            if traction_mode == "Draw on map":
+                # Capture drawn lines so they are available on the next rerun (e.g., when scoring).
+                drawings = _extract_drawings(map_output)
+                if drawings:
+                    new_payload = _drawings_to_feature_collection(drawings)
+                    if new_payload.get("features"):
+                        st.session_state["drawn_line_features"] = new_payload
+                        st.session_state["drawn_line_path"] = str(_write_temp_geojson(new_payload))
         except Exception as exc:  # noqa: BLE001
             st.error(f"Failed to render map: {exc}")
 
