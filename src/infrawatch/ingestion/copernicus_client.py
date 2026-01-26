@@ -2,20 +2,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import base64
 import json
 import logging
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-import base64
 
 from .models import IngestionRequest, SceneMetadata, SceneSummary
 from .paths import as_bbox_list, select_asset_filename
 
-STAC_ENDPOINT = "https://catalogue.dataspace.copernicus.eu/stac/search"
-COLLECTION_ID = "SENTINEL-2"
-PRODUCT_TYPE = "S2MSI2A"
+# Copernicus Data Space Ecosystem (CDSE) STAC API v1
+STAC_ENDPOINT = "https://stac.dataspace.copernicus.eu/v1/search"
+# CDSE STAC collection id for Sentinel-2 Level-2A
+COLLECTION_ID = "sentinel-2-l2a"
 DOWNLOAD_TIMEOUT = 120
 
 logger = logging.getLogger(__name__)
@@ -77,10 +78,9 @@ def build_search_payload(request: IngestionRequest) -> dict[str, Any]:
         "bbox": as_bbox_list(request.bbox),
         "datetime": datetime_filter,
         "limit": request.max_scenes,
-        "query": {"productType": {"eq": PRODUCT_TYPE}},
     }
     if request.max_cloud_cover is not None:
-        payload["query"]["eo:cloud_cover"] = {"lte": request.max_cloud_cover}
+        payload["query"] = {"eo:cloud_cover": {"lte": request.max_cloud_cover}}
     return payload
 
 
