@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 from .models import IngestionRequest, SceneMetadata, SceneSummary
@@ -89,10 +89,18 @@ class CopernicusClient:
 
     def _odata_product_uuid_for_name(self, product_safe_name: str) -> str:
         """
-        Resolve OData product UUID by Name eq '<PRODUCT>.SAFE'
+        Resolve OData product UUID by querying:
+          Products?$filter=Name eq '<PRODUCT>.SAFE'
+
+        IMPORTANT: The $filter value must be URL-encoded (spaces, quotes).
         """
         token = self._get_access_token()
-        url = f"{ODATA_BASE}/Products?$filter=Name eq '{product_safe_name}'"
+
+        # Build the filter expression and encode it properly
+        filter_expr = f"Name eq '{product_safe_name}'"
+        qs = urlencode({"$filter": filter_expr})
+        url = f"{ODATA_BASE}/Products?{qs}"
+
         req = Request(url, headers={"Authorization": f"Bearer {token}"})
         try:
             with urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp:
@@ -117,15 +125,14 @@ class CopernicusClient:
         into:
           /Products(<uuid>)/Nodes(<PRODUCT>.SAFE)/Nodes(...)/$value
 
-        Then download the file using Bearer token, following redirects.
+        Then download the file using Bearer token.
         """
-        # Parse s3 path
         if not s3_href.startswith("s3://eodata/"):
             raise RuntimeError(f"Expected s3://eodata/ href, got: {s3_href}")
 
         rel = s3_href[len("s3://eodata/") :]
-        # Find "<PRODUCT>.SAFE" segment
         parts = rel.split("/")
+
         safe_idx = None
         for i, p in enumerate(parts):
             if p.endswith(".SAFE"):
@@ -139,18 +146,14 @@ class CopernicusClient:
         if not inside_parts:
             raise RuntimeError(f"No file path inside product for: {s3_href}")
 
-        # Resolve UUID and build Nodes URL
         product_uuid = self._odata_product_uuid_for_name(product_safe_name)
 
-        # Build Nodes(...) chain; quote each node but keep parentheses and slashes safe
         def node(seg: str) -> str:
-            # Encode special characters safely for URL path segment
             return f"Nodes({quote(seg, safe='-_.()')})"
 
         nodes_chain = "/".join([node(product_safe_name)] + [node(p) for p in inside_parts])
         url = f"{ODATA_BASE}/Products({product_uuid})/{nodes_chain}/$value"
 
-        # Download (handle redirects manually to preserve Authorization until final URL)
         token = self._get_access_token()
         headers = {"Authorization": f"Bearer {token}"}
 
@@ -161,43 +164,24 @@ class CopernicusClient:
         logger.info("Downloading via OData Nodes -> %s", output_path)
 
         try:
-            current = url
-            for _ in range(10):
-                req = Request(current, headers=headers)
-                try:
-                    resp = urlopen(req, timeout=DOWNLOAD_TIMEOUT)
-                except HTTPError as exc:
-                    # Handle redirects via HTTPError for some urllib handlers
-                    if exc.code in (301, 302, 303, 307, 308) and exc.headers.get("Location"):
-                        current = exc.headers["Location"]
-                        continue
-                    raise
-                # If we got here, it's a 200-like response
-                with resp:
-                    with output_path.open("wb") as handle:
-                        while True:
-                            chunk = resp.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            handle.write(chunk)
-                return output_path
-
-            raise RuntimeError("Too many redirects while downloading via OData Nodes().")
+            req = Request(url, headers=headers)
+            with urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp:
+                with output_path.open("wb") as handle:
+                    while True:
+                        chunk = resp.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+            return output_path
         except HTTPError as exc:
-            raise RuntimeError(http_error_message(exc, current)) from exc
+            raise RuntimeError(http_error_message(exc, url)) from exc
         except URLError as exc:
-            raise RuntimeError(f"Network error while downloading {current}: {exc}") from exc
+            raise RuntimeError(f"Network error while downloading {url}: {exc}") from exc
 
     def download_scene(self, scene: SceneSummary, destination_dir: Path) -> Path:
-        """
-        MVP behaviour:
-        - If scene.download_url is s3://eodata/... -> download file via OData Nodes() using Bearer token
-        - Otherwise download directly via HTTPS with Basic Auth (fallback)
-        """
         if scene.download_url.startswith("s3://eodata/"):
             return self._download_via_odata_nodes(scene.download_url, destination_dir)
 
-        # Fallback: direct HTTPS (rare for CDSE STAC, but kept for robustness)
         destination_dir.mkdir(parents=True, exist_ok=True)
         filename = select_asset_filename(scene.download_url, f"{scene.product_id}.bin")
         output_path = destination_dir / filename
