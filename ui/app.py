@@ -42,7 +42,6 @@ LOG_PATH = Path("ui_runtime.log")
 DEFAULT_UTM_EPSG = 32633
 LONGITUDE_LIMIT_DEG = 180
 LATITUDE_LIMIT_DEG = 90
-DEMO_SEGMENT_HALF_LENGTH_M = 150.0
 
 
 def _get_logger() -> logging.Logger:
@@ -246,8 +245,8 @@ def load_ndvi_overlay(ndvi_path: Path) -> tuple[str, list[list[float]], Any] | N
         encoded = base64.b64encode(buf.read()).decode("ascii")
         data_url = f"data:image/png;base64,{encoded}"
 
-        wgs_bounds = transform_bounds(ndvi_crs, CRS.from_epsg(4326), *bounds)
-        bounds_list = [[wgs_bounds[1], wgs_bounds[0]], [wgs_bounds[3], wgs_bounds[2]]]
+        wgs_bounds = transform_bounds(ndvi_crs, CRS.from_epsg(4326), *bounds, always_xy=True)
+        bounds_list = [[wgs_bounds[0], wgs_bounds[1]], [wgs_bounds[2], wgs_bounds[3]]]
         logger.info("ndvi_overlay_loaded path=%s", ndvi_path)
         return data_url, bounds_list, ndvi_crs
     except Exception as exc:  # noqa: BLE001
@@ -257,7 +256,7 @@ def load_ndvi_overlay(ndvi_path: Path) -> tuple[str, list[list[float]], Any] | N
 
 
 def read_ndvi_metadata(ndvi_path: Path) -> tuple[Any, Any, list[list[float]] | None]:
-    """Return NDVI CRS, bounds in native CRS, and bounds in EPSG:4326."""
+    """Return NDVI CRS, bounds in native CRS, and bounds in EPSG:4326 (lon/lat)."""
     logger = _get_logger()
     import rasterio
     from rasterio.crs import CRS
@@ -269,8 +268,8 @@ def read_ndvi_metadata(ndvi_path: Path) -> tuple[Any, Any, list[list[float]] | N
             crs = dataset.crs
         if crs is None:
             return None, bounds, None
-        wgs_bounds = transform_bounds(crs, CRS.from_epsg(4326), *bounds)
-        bounds_list = [[wgs_bounds[1], wgs_bounds[0]], [wgs_bounds[3], wgs_bounds[2]]]
+        wgs_bounds = transform_bounds(crs, CRS.from_epsg(4326), *bounds, always_xy=True)
+        bounds_list = [[wgs_bounds[0], wgs_bounds[1]], [wgs_bounds[2], wgs_bounds[3]]]
         return crs, bounds, bounds_list
     except Exception as exc:  # noqa: BLE001
         st.error(f"Failed to read NDVI metadata: {exc}")
@@ -281,15 +280,27 @@ def read_ndvi_metadata(ndvi_path: Path) -> tuple[Any, Any, list[list[float]] | N
 def generate_demo_segment(ndvi_path: Path, output_path: Path) -> Path | None:
     """Generate a short demo LineString centered in the NDVI bounds."""
     import rasterio
+    from pyproj import CRS
+    from rasterio.warp import transform_bounds
 
     try:
         with rasterio.open(ndvi_path) as dataset:
             bounds = dataset.bounds
-        center_x = (bounds.left + bounds.right) / 2
-        center_y = (bounds.bottom + bounds.top) / 2
+            ndvi_crs = dataset.crs
+        if ndvi_crs is None:
+            raise ValueError("NDVI CRS unavailable; cannot generate demo segment.")
+        wgs_bounds = transform_bounds(ndvi_crs, CRS.from_epsg(4326), *bounds, always_xy=True)
+        min_lon, min_lat, max_lon, max_lat = wgs_bounds
+        mid_lat = (min_lat + max_lat) / 2
+        span_lon = max_lon - min_lon
+        if span_lon <= 0:
+            raise ValueError("NDVI bounds invalid for demo segment.")
+        padding = span_lon * 0.2
+        lon_start = min_lon + padding
+        lon_end = max_lon - padding
         coords = [
-            [center_x - DEMO_SEGMENT_HALF_LENGTH_M, center_y],
-            [center_x + DEMO_SEGMENT_HALF_LENGTH_M, center_y],
+            [lon_start, mid_lat],
+            [lon_end, mid_lat],
         ]
         payload = {
             "type": "FeatureCollection",
@@ -346,7 +357,16 @@ def bounds_from_features(features: list[dict[str, Any]]) -> list[list[float]] | 
                 lats.append(coord[1])
     if not lats or not lons:
         return None
-    return [[min(lats), min(lons)], [max(lats), max(lons)]]
+    return [[min(lons), min(lats)], [max(lons), max(lats)]]
+
+
+def bounds_to_folium(bounds_lon_lat: list[list[float]] | None) -> list[list[float]] | None:
+    if not bounds_lon_lat:
+        return None
+    return [
+        [bounds_lon_lat[0][1], bounds_lon_lat[0][0]],
+        [bounds_lon_lat[1][1], bounds_lon_lat[1][0]],
+    ]
 
 
 def build_results_table(results: list[dict[str, Any]]) -> pd.DataFrame:
@@ -471,6 +491,52 @@ def sanitize_features_for_map(features: list[dict[str, Any]]) -> list[dict[str, 
     return sanitized_features
 
 
+def validate_map_features(features: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    warnings: list[str] = []
+    valid_features: list[dict[str, Any]] = []
+
+    def is_finite_number(value: Any) -> bool:
+        if isinstance(value, (int, float)):
+            return np.isfinite(value)
+        return False
+
+    for idx, feature in enumerate(features, start=1):
+        geometry = feature.get("geometry")
+        if not geometry or not isinstance(geometry, dict):
+            warnings.append(f"Feature {idx} missing geometry.")
+            continue
+        geometry_type = geometry.get("type")
+        if not geometry_type:
+            warnings.append(f"Feature {idx} missing geometry type.")
+            continue
+        coords = geometry.get("coordinates")
+        if coords is None:
+            warnings.append(f"Feature {idx} missing coordinates.")
+            continue
+        has_coords = False
+        invalid_coord = False
+        for coord in iter_coordinates(coords):
+            if coord and len(coord) >= 2:
+                has_coords = True
+                if not (is_finite_number(coord[0]) and is_finite_number(coord[1])):
+                    invalid_coord = True
+                    break
+        if not has_coords:
+            warnings.append(f"Feature {idx} has empty coordinates.")
+            continue
+        if invalid_coord:
+            warnings.append(f"Feature {idx} has invalid coordinate values.")
+            continue
+        normalized = dict(feature)
+        normalized["geometry"] = normalize_geojson_coordinates(geometry)
+        valid_features.append(normalized)
+    return valid_features, warnings
+
+
+def build_feature_collection(features: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"type": "FeatureCollection", "features": features}
+
+
 def create_map(
     ndvi_overlay: tuple[str, list[list[float]], CRS] | None,
     line_features: list[dict[str, Any]],
@@ -480,8 +546,8 @@ def create_map(
     fit_bounds: list[list[float]] | None,
 ) -> folium.Map:
     if fit_bounds:
-        center_lat = (fit_bounds[0][0] + fit_bounds[1][0]) / 2
-        center_lon = (fit_bounds[0][1] + fit_bounds[1][1]) / 2
+        center_lat = (fit_bounds[0][1] + fit_bounds[1][1]) / 2
+        center_lon = (fit_bounds[0][0] + fit_bounds[1][0]) / 2
     else:
         center_lat, center_lon = 0, 0
 
@@ -489,9 +555,10 @@ def create_map(
 
     if ndvi_overlay:
         image, bounds, _ = ndvi_overlay
+        folium_bounds = bounds_to_folium(bounds)
         folium.raster_layers.ImageOverlay(
             image=image,
-            bounds=bounds,
+            bounds=folium_bounds,
             opacity=opacity,
             name="NDVI",
         ).add_to(fmap)
@@ -533,13 +600,16 @@ def create_map(
     )
 
     if line_features:
-        folium.GeoJson(line_features, name="Traction Segments", style_function=style_line, tooltip=tooltip).add_to(
-            fmap
-        )
+        folium.GeoJson(
+            build_feature_collection(line_features),
+            name="Traction Segments",
+            style_function=style_line,
+            tooltip=tooltip,
+        ).add_to(fmap)
 
     if show_buffers and buffer_features:
         folium.GeoJson(
-            buffer_features,
+            build_feature_collection(buffer_features),
             name="Buffers",
             style_function=lambda feature: {
                 "color": "#3182bd",
@@ -552,7 +622,7 @@ def create_map(
 
     folium.LayerControl(collapsed=False).add_to(fmap)
     if fit_bounds:
-        fmap.fit_bounds(fit_bounds)
+        fmap.fit_bounds(bounds_to_folium(fit_bounds))
     return fmap
 
 
@@ -736,13 +806,20 @@ def main() -> None:
 
     with map_column:
         try:
-            map_features = sanitize_features_for_map(line_features)
+            valid_line_features, line_warnings = validate_map_features(line_features)
+            valid_buffer_features, buffer_warnings = validate_map_features(buffer_features)
+            if show_debug:
+                for warning in line_warnings:
+                    st.warning(f"Skipping invalid segment geometry: {warning}")
+                for warning in buffer_warnings:
+                    st.warning(f"Skipping invalid buffer geometry: {warning}")
+            map_features = sanitize_features_for_map(valid_line_features)
             fit_bounds = bounds_from_features(map_features)
             if fit_bounds is None and ndvi_bounds_wgs84:
                 fit_bounds = ndvi_bounds_wgs84
             if fit_bounds is None:
-                fit_bounds = bounds_from_features(line_features)
-            buffer_features_for_map = sanitize_features_for_map(buffer_features)
+                fit_bounds = bounds_from_features(valid_line_features)
+            buffer_features_for_map = sanitize_features_for_map(valid_buffer_features)
             if not map_features:
                 st.info("No segments available to display on map.")
             fmap = create_map(
