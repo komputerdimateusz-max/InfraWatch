@@ -89,12 +89,6 @@ class CopernicusClient:
         return token
 
     def _odata_product_uuid_for_name(self, product_safe_name: str) -> str:
-        """
-        Resolve OData product UUID by querying:
-          Products?$filter=Name eq '<PRODUCT>.SAFE'
-
-        IMPORTANT: The $filter value must be URL-encoded (spaces, quotes).
-        """
         token = self._get_access_token()
         filter_expr = f"Name eq '{product_safe_name}'"
         qs = urlencode({"$filter": filter_expr})
@@ -119,12 +113,7 @@ class CopernicusClient:
 
     def _download_via_odata_nodes(self, s3_href: str, destination_dir: Path) -> Path:
         """
-        Convert:
-          s3://eodata/.../<PRODUCT>.SAFE/<path/to/file>
-        into:
-          /Products(<uuid>)/Nodes(<PRODUCT>.SAFE)/Nodes(...)/$value
-
-        Then download the file using Bearer token.
+        Download a single file from a product given an s3://eodata/... href via OData Nodes().
         """
         if not s3_href.startswith("s3://eodata/"):
             raise RuntimeError(f"Expected s3://eodata/ href, got: {s3_href}")
@@ -157,8 +146,7 @@ class CopernicusClient:
         headers = {"Authorization": f"Bearer {token}"}
 
         destination_dir.mkdir(parents=True, exist_ok=True)
-        filename = inside_parts[-1]
-        output_path = destination_dir / filename
+        output_path = destination_dir / inside_parts[-1]
 
         logger.info("Downloading via OData Nodes -> %s", output_path)
 
@@ -177,34 +165,42 @@ class CopernicusClient:
         except URLError as exc:
             raise RuntimeError(f"Network error while downloading {url}: {exc}") from exc
 
-    def download_scene(self, scene: SceneSummary, destination_dir: Path) -> Path:
-        if scene.download_url.startswith("s3://eodata/"):
-            return self._download_via_odata_nodes(scene.download_url, destination_dir)
+    def download_scene(self, scene: SceneSummary, destination_dir: Path) -> dict[str, Path]:
+        """
+        Download all requested assets for a scene.
+        Returns: mapping band -> local file path
+        """
+        downloaded: dict[str, Path] = {}
+        for band, href in scene.assets.items():
+            # Choose filename by href; if it lacks extension, fallback to band
+            filename_fallback = f"{scene.product_id}_{band}.bin"
+            _ = select_asset_filename(href, filename_fallback)  # keep behavior consistent even if not used
+            path = self._download_via_odata_nodes(href, destination_dir) if href.startswith("s3://eodata/") else None
+            if path is None:
+                # Fallback HTTPS download (rare); keep minimal
+                destination_dir.mkdir(parents=True, exist_ok=True)
+                fname = select_asset_filename(href, filename_fallback)
+                output_path = destination_dir / fname
+                headers: dict[str, str] = {}
+                if self.auth:
+                    headers["Authorization"] = self.auth.basic_header()
+                req = Request(href, headers=headers)
+                try:
+                    with urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp:
+                        with output_path.open("wb") as handle:
+                            while True:
+                                chunk = resp.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                handle.write(chunk)
+                except HTTPError as exc:
+                    raise RuntimeError(http_error_message(exc, href)) from exc
+                except URLError as exc:
+                    raise RuntimeError(f"Network error while downloading {href}: {exc}") from exc
+                path = output_path
 
-        destination_dir.mkdir(parents=True, exist_ok=True)
-        filename = select_asset_filename(scene.download_url, f"{scene.product_id}.bin")
-        output_path = destination_dir / filename
-
-        logger.info("Downloading %s -> %s", scene.product_id, output_path)
-        headers: dict[str, str] = {}
-        if self.auth:
-            headers["Authorization"] = self.auth.basic_header()
-
-        request = Request(scene.download_url, headers=headers)
-        try:
-            with urlopen(request, timeout=DOWNLOAD_TIMEOUT) as response:
-                with output_path.open("wb") as handle:
-                    while True:
-                        chunk = response.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        handle.write(chunk)
-        except HTTPError as exc:
-            raise RuntimeError(http_error_message(exc, scene.download_url)) from exc
-        except URLError as exc:
-            raise RuntimeError(f"Network error while downloading {scene.download_url}: {exc}") from exc
-
-        return output_path
+            downloaded[band] = path
+        return downloaded
 
 
 def build_search_payload(request: IngestionRequest) -> dict[str, Any]:
@@ -250,7 +246,7 @@ def scene_from_feature(feature: Mapping[str, Any]) -> SceneSummary:
     if len(bbox) != 4:
         raise RuntimeError("Scene is missing a valid bbox.")
 
-    download_url = select_download_url(feature.get("assets", {}))
+    assets = select_ndvi_assets(feature.get("assets", {}))
 
     return SceneSummary(
         product_id=product_id,
@@ -259,19 +255,32 @@ def scene_from_feature(feature: Mapping[str, Any]) -> SceneSummary:
         cloud_cover=cloud_cover,
         bbox=tuple(float(value) for value in bbox),
         footprint=feature.get("geometry"),
-        download_url=download_url,
+        assets=assets,
     )
 
 
-def select_download_url(assets: Mapping[str, Any]) -> str:
-    for key in ("download", "data", "product", "analytic", "visual"):
-        asset = assets.get(key)
-        if asset and "href" in asset:
-            return asset["href"]
-    for asset in assets.values():
-        if isinstance(asset, Mapping) and "href" in asset:
-            return asset["href"]
-    raise RuntimeError("No downloadable asset found in STAC item.")
+def select_ndvi_assets(assets: Mapping[str, Any]) -> dict[str, str]:
+    """
+    Select the minimum assets required to compute NDVI: B04 (red) and B08 (nir).
+    STAC implementations may differ in exact keys; we try a few common patterns.
+    """
+    def pick(keys: list[str]) -> str | None:
+        for k in keys:
+            asset = assets.get(k)
+            if asset and isinstance(asset, Mapping) and "href" in asset:
+                return str(asset["href"])
+        return None
+
+    b04 = pick(["B04", "b04", "red", "B04_10m", "B04_20m"])
+    b08 = pick(["B08", "b08", "nir", "B08_10m", "B08_20m"])
+
+    missing = [name for name, val in (("B04", b04), ("B08", b08)) if not val]
+    if missing:
+        raise RuntimeError(
+            f"Missing required NDVI assets {missing}. Available STAC asset keys: {list(assets.keys())}"
+        )
+
+    return {"B04": b04, "B08": b08}  # type: ignore[return-value]
 
 
 def parse_datetime(value: str) -> datetime:
@@ -288,7 +297,7 @@ def scene_metadata(scene: SceneSummary, endpoint: str, query: Mapping[str, Any])
         bbox=scene.bbox,
         footprint=scene.footprint,
         source_endpoint=endpoint,
-        source_query=query,
+        source_query=dict(query),
     )
 
 

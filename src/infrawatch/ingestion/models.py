@@ -1,49 +1,38 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Any, Mapping
-
-from pydantic import BaseModel, Field, field_validator, model_validator
-
-from .paths import validate_bbox
+from typing import Any
 
 
-class IngestionRequest(BaseModel):
-    bbox: tuple[float, float, float, float]
-    date_from: date = Field(alias="dateFrom")
-    date_to: date = Field(alias="dateTo")
-    max_scenes: int = Field(alias="maxScenes", ge=1)
-    max_cloud_cover: float | None = Field(default=None, alias="maxCloudCover", ge=0, le=100)
-    dry_run: bool = Field(default=False, alias="dryRun")
-
-    @field_validator("bbox")
-    @classmethod
-    def _validate_bbox(cls, value: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
-        return validate_bbox(value)
-
-    @model_validator(mode="after")
-    def _validate_dates(self) -> "IngestionRequest":
-        if self.date_from > self.date_to:
-            raise ValueError("date_from must be on or before date_to.")
-        return self
+@dataclass(frozen=True)
+class IngestionRequest:
+    bbox: tuple[float, float, float, float]  # (min_lon, min_lat, max_lon, max_lat)
+    date_from: date
+    date_to: date
+    max_scenes: int = 3
+    max_cloud_cover: float | None = None
 
 
-class SceneSummary(BaseModel):
+@dataclass(frozen=True)
+class SceneSummary:
     product_id: str
     title: str
     acquisition_datetime: datetime
     cloud_cover: float | None
     bbox: tuple[float, float, float, float]
-    footprint: Mapping[str, Any] | None
-    download_url: str
+    footprint: Any | None
+    assets: dict[str, str]  # e.g. {"B04": "s3://eodata/...", "B08": "s3://eodata/..."}
 
 
-class SceneMetadata(BaseModel):
+@dataclass(frozen=True)
+class SceneMetadata:
     product_id: str
     title: str
     acquisition_datetime: datetime
     cloud_cover: float | None
     bbox: tuple[float, float, float, float]
-    footprint: Mapping[str, Any] | None
+    footprint: Any | None
     source_endpoint: str
-    source_query: Mapping[str, Any]
+    source_query: dict[str, Any]
+    downloaded_assets: dict[str, str] | None = None  # band -> local path (optional, set by CLI)
