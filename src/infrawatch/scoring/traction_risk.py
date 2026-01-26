@@ -8,13 +8,14 @@ from typing import Any
 
 import numpy as np
 import rasterio
-from pyproj import CRS, Transformer
+from pyproj import CRS
 from rasterio.errors import WindowError
 from rasterio.features import rasterize
 from rasterio.windows import Window, from_bounds
 from shapely.geometry import shape
 from shapely.ops import transform as shapely_transform
 
+from infrawatch.utils.crs import normalize_crs, to_crs_transformer
 
 def _load_geojson(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -46,28 +47,20 @@ def _risk_score(mean_ndvi: float, p90_ndvi: float, pct_above_0_6: float) -> floa
     return float(np.clip((1.0 - vegetation_score) * 100.0, 0.0, 100.0))
 
 
-def _normalize_crs(value: Any) -> CRS | None:
-    if value is None:
-        return None
-    return CRS.from_user_input(value)
-
-
 def _detect_geojson_crs(payload: dict[str, Any]) -> CRS | None:
     crs_payload = payload.get("crs")
     if isinstance(crs_payload, dict):
         props = crs_payload.get("properties") or {}
         name = props.get("name")
         if name:
-            return _normalize_crs(name)
+            return normalize_crs(name)
     return None
 
 
 def reproject_shapely_geom(geom, src_crs: Any, dst_crs: Any):
-    src = _normalize_crs(src_crs)
-    dst = _normalize_crs(dst_crs)
-    if src is None or dst is None or src == dst:
+    transformer = to_crs_transformer(src_crs, dst_crs)
+    if transformer is None:
         return geom
-    transformer = Transformer.from_crs(src, dst, always_xy=True)
     return shapely_transform(transformer.transform, geom)
 
 
@@ -101,16 +94,20 @@ def _sample_ndvi_for_line_dataset(
     try:
         window = from_bounds(*bounds, transform=dataset.transform)
         window = window.intersection(Window(0, 0, dataset.width, dataset.height))
+        # Round to pixel grid so raster reads and masks align exactly.
+        window = window.round_offsets().round_lengths()
     except WindowError:
         return _no_data_stats()
 
-    if window.width <= 0 or window.height <= 0:
+    if window.width < 1 or window.height < 1:
         return _no_data_stats()
 
     data = dataset.read(1, window=window, masked=True).astype(np.float32)
+    if data.size == 0:
+        return _no_data_stats()
     mask = rasterize(
         [(buffered, 1)],
-        out_shape=(int(window.height), int(window.width)),
+        out_shape=data.shape,
         transform=dataset.window_transform(window),
         fill=0,
         dtype="uint8",
@@ -169,7 +166,7 @@ def score_traction_segments(
 
     results: list[dict[str, Any]] = []
 
-    resolved_lines_crs = _normalize_crs(lines_crs) or _detect_geojson_crs(lines_payload)
+    resolved_lines_crs = normalize_crs(lines_crs) or _detect_geojson_crs(lines_payload)
 
     with rasterio.open(ndvi_path) as dataset:
         for idx, feature in enumerate(features, start=1):
