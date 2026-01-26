@@ -1,5 +1,6 @@
 {
   "type": "FeatureCollection",
+  "crs": {"type": "name", "properties": {"name": "EPSG:32633"}},
   "features": [
     {
       "type": "Feature",
@@ -8,8 +9,8 @@
       "geometry": {
         "type": "LineString",
         "coordinates": [
-          [500000.0, 5100000.0],
-          [500100.0, 5100100.0]
+          [500000.0, 5790000.0],
+          [500100.0, 5790100.0]
         ]
       }
     },
@@ -20,8 +21,8 @@
       "geometry": {
         "type": "LineString",
         "coordinates": [
-          [500200.0, 5100200.0],
-          [500300.0, 5100300.0]
+          [500200.0, 5790200.0],
+          [500300.0, 5790300.0]
         ]
       }
     }
