@@ -584,10 +584,48 @@ def read_ndvi_sample_stats(ndvi_path: Path, center_x: float, center_y: float) ->
     with rasterio.open(ndvi_path) as dataset:
         row, col = dataset.index(center_x, center_y)
         half = NDVI_SAMPLE_WINDOW_PIXELS // 2
-        col_off = max(col - half, 0)
-        row_off = max(row - half, 0)
-        width = min(NDVI_SAMPLE_WINDOW_PIXELS, dataset.width - col_off)
-        height = min(NDVI_SAMPLE_WINDOW_PIXELS, dataset.height - row_off)
+        col_off = col - half
+        row_off = row - half
+        width = NDVI_SAMPLE_WINDOW_PIXELS
+        height = NDVI_SAMPLE_WINDOW_PIXELS
+        original_window = {
+            "col_off": int(col_off),
+            "row_off": int(row_off),
+            "width": int(width),
+            "height": int(height),
+        }
+        col_off = max(0, col_off)
+        row_off = max(0, row_off)
+        max_col = min(col_off + width, dataset.width)
+        max_row = min(row_off + height, dataset.height)
+        width = max_col - col_off
+        height = max_row - row_off
+        clipped_window = {
+            "col_off": int(col_off),
+            "row_off": int(row_off),
+            "width": int(width),
+            "height": int(height),
+        }
+        st.debug(
+            {
+                "ndvi_sample_centroid": {"x": center_x, "y": center_y},
+                "ndvi_raster_size": {"width": dataset.width, "height": dataset.height},
+                "ndvi_window_original": original_window,
+                "ndvi_window_clipped": clipped_window,
+            }
+        )
+        if width <= 0 or height <= 0:
+            return {
+                "window": [int(col_off), int(row_off), int(width), int(height)],
+                "count": 0,
+                "min": None,
+                "max": None,
+                "mean": None,
+                "mean_ndvi": None,
+                "p90_ndvi": None,
+                "pct_above_0_6": None,
+                "data_status": "NO_DATA",
+            }
         window = Window(col_off, row_off, width, height)
         values = dataset.read(1, window=window, masked=True).astype(np.float32)
     values = np.ma.masked_invalid(values)
@@ -598,13 +636,24 @@ def read_ndvi_sample_stats(ndvi_path: Path, center_x: float, center_y: float) ->
             "min": None,
             "max": None,
             "mean": None,
+            "mean_ndvi": None,
+            "p90_ndvi": None,
+            "pct_above_0_6": None,
+            "data_status": "NO_DATA",
         }
+    mean_ndvi = float(values.mean())
+    p90_ndvi = float(np.percentile(values.compressed(), 90))
+    pct_above_0_6 = float((values > 0.6).mean() * 100.0)
     return {
         "window": [int(col_off), int(row_off), int(width), int(height)],
         "count": int(values.count()),
         "min": float(values.min()),
         "max": float(values.max()),
         "mean": float(values.mean()),
+        "mean_ndvi": mean_ndvi,
+        "p90_ndvi": p90_ndvi,
+        "pct_above_0_6": pct_above_0_6,
+        "data_status": "OK",
     }
 
 
