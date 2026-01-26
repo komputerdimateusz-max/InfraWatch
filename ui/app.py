@@ -27,6 +27,7 @@ from folium.features import GeoJsonTooltip
 from streamlit_folium import st_folium
 
 from infrawatch.scoring import score_traction_segments
+from infrawatch.scoring.traction_risk import sample_ndvi_for_line
 
 
 @dataclass
@@ -42,7 +43,6 @@ DEFAULT_UTM_EPSG = 32633
 LONGITUDE_LIMIT_DEG = 180
 LATITUDE_LIMIT_DEG = 90
 DEMO_SEGMENT_HALF_LENGTH_M = 150.0
-NDVI_SAMPLE_WINDOW_PIXELS = 5
 
 
 def _get_logger() -> logging.Logger:
@@ -556,107 +556,6 @@ def create_map(
     return fmap
 
 
-def extract_first_line_centroid(
-    lines_payload: dict[str, Any],
-    source_crs,
-    ndvi_crs,
-) -> tuple[float, float] | None:
-    from shapely.geometry import shape
-
-    features = lines_payload.get("features", [])
-    if not features:
-        return None
-    geometry = features[0].get("geometry")
-    if geometry is None:
-        return None
-    geom = shape(geometry)
-    transformer = to_crs_transformer(source_crs, ndvi_crs)
-    ndvi_geom = transform_geometry(geom, transformer)
-    centroid = ndvi_geom.centroid
-    return centroid.x, centroid.y
-
-
-def read_ndvi_sample_stats(ndvi_path: Path, center_x: float, center_y: float) -> dict[str, Any]:
-    """Return NDVI stats for a small pixel window around the center."""
-    import rasterio
-    from rasterio.windows import Window
-
-    with rasterio.open(ndvi_path) as dataset:
-        row, col = dataset.index(center_x, center_y)
-        half = NDVI_SAMPLE_WINDOW_PIXELS // 2
-        col_off = col - half
-        row_off = row - half
-        width = NDVI_SAMPLE_WINDOW_PIXELS
-        height = NDVI_SAMPLE_WINDOW_PIXELS
-        original_window = {
-            "col_off": int(col_off),
-            "row_off": int(row_off),
-            "width": int(width),
-            "height": int(height),
-        }
-        col_off = max(0, col_off)
-        row_off = max(0, row_off)
-        max_col = min(col_off + width, dataset.width)
-        max_row = min(row_off + height, dataset.height)
-        width = max_col - col_off
-        height = max_row - row_off
-        clipped_window = {
-            "col_off": int(col_off),
-            "row_off": int(row_off),
-            "width": int(width),
-            "height": int(height),
-        }
-        st.caption(
-            {
-                "ndvi_sample_centroid": {"x": center_x, "y": center_y},
-                "ndvi_raster_size": {"width": dataset.width, "height": dataset.height},
-                "ndvi_window_original": original_window,
-                "ndvi_window_clipped": clipped_window,
-            }
-        )
-        if width <= 0 or height <= 0:
-            return {
-                "window": [int(col_off), int(row_off), int(width), int(height)],
-                "count": 0,
-                "min": None,
-                "max": None,
-                "mean": None,
-                "mean_ndvi": None,
-                "p90_ndvi": None,
-                "pct_above_0_6": None,
-                "data_status": "NO_DATA",
-            }
-        window = Window(col_off, row_off, width, height)
-        values = dataset.read(1, window=window, masked=True).astype(np.float32)
-    values = np.ma.masked_invalid(values)
-    if values.count() == 0:
-        return {
-            "window": [int(col_off), int(row_off), int(width), int(height)],
-            "count": 0,
-            "min": None,
-            "max": None,
-            "mean": None,
-            "mean_ndvi": None,
-            "p90_ndvi": None,
-            "pct_above_0_6": None,
-            "data_status": "NO_DATA",
-        }
-    mean_ndvi = float(values.mean())
-    p90_ndvi = float(np.percentile(values.compressed(), 90))
-    pct_above_0_6 = float((values > 0.6).mean() * 100.0)
-    return {
-        "window": [int(col_off), int(row_off), int(width), int(height)],
-        "count": int(values.count()),
-        "min": float(values.min()),
-        "max": float(values.max()),
-        "mean": float(values.mean()),
-        "mean_ndvi": mean_ndvi,
-        "p90_ndvi": p90_ndvi,
-        "pct_above_0_6": pct_above_0_6,
-        "data_status": "OK",
-    }
-
-
 def main() -> None:
     st.set_page_config(page_title="InfraWatch MVP", layout="wide")
     st.title("InfraWatch — Traction Vegetation Risk")
@@ -707,6 +606,7 @@ def main() -> None:
         opacity = st.slider("NDVI overlay opacity", min_value=0.1, max_value=1.0, value=0.6)
         run_scoring = st.button("Run scoring")
         show_buffers = st.checkbox("Show buffer polygons", value=True)
+        show_debug = st.checkbox("Show debug details", value=False)
 
     ndvi_path = Path(ndvi_path_input).expanduser()
     lines_path = Path(lines_path_input).expanduser()
@@ -777,7 +677,7 @@ def main() -> None:
             "NDVI returned NO_DATA for one or more segments. This usually means the segment "
             "geometry does not overlap the NDVI raster or uses a mismatched CRS."
         )
-        if ndvi_bounds is not None:
+        if show_debug and ndvi_bounds is not None:
             debug_payload: dict[str, Any] = {
                 "ndvi_bounds_native": {
                     "left": ndvi_bounds.left,
@@ -789,14 +689,22 @@ def main() -> None:
             }
             if lines_payload and ndvi_path.exists():
                 source_crs = lines_crs or detect_geojson_crs(lines_payload, ndvi_crs)
-                centroid = extract_first_line_centroid(lines_payload, source_crs, ndvi_crs or source_crs)
-                if centroid:
-                    sample_stats = read_ndvi_sample_stats(ndvi_path, centroid[0], centroid[1])
-                    debug_payload["sample_centroid_ndvi_crs"] = {
-                        "x": centroid[0],
-                        "y": centroid[1],
-                    }
-                    debug_payload["sample_window_stats"] = sample_stats
+                from shapely.geometry import shape
+
+                first_feature = next(
+                    (feature for feature in lines_payload.get("features", []) if feature.get("geometry")), None
+                )
+                if first_feature:
+                    geom = shape(first_feature["geometry"])
+                    sample_stats = sample_ndvi_for_line(
+                        ndvi_path,
+                        geom,
+                        buffer_m,
+                        line_crs=source_crs,
+                    )
+                    debug_payload["sample_line_stats"] = sample_stats
+                    debug_payload["sample_buffer_m"] = buffer_m
+                    debug_payload["sample_geom_type"] = geom.geom_type
             st.code(json.dumps(debug_payload, indent=2))
 
     if lines_payload:
@@ -828,30 +736,18 @@ def main() -> None:
 
     with map_column:
         try:
-            valid_features = [
-                feature
-                for feature in line_features
-                if (feature.get("properties") or {}).get("data_status") != "NO_DATA"
-            ]
-            valid_features = sanitize_features_for_map(valid_features)
-            fit_bounds = bounds_from_features(valid_features)
+            map_features = sanitize_features_for_map(line_features)
+            fit_bounds = bounds_from_features(map_features)
             if fit_bounds is None and ndvi_bounds_wgs84:
                 fit_bounds = ndvi_bounds_wgs84
             if fit_bounds is None:
                 fit_bounds = bounds_from_features(line_features)
-            valid_segment_ids = {
-                (feature.get("properties") or {}).get("segment_id") for feature in valid_features
-            }
-            buffer_features_for_map = [
-                feature
-                for feature in buffer_features
-                if (feature.get("properties") or {}).get("segment_id") in valid_segment_ids
-            ]
-            if not valid_features:
-                st.info("No segments with valid NDVI data to display on map.")
+            buffer_features_for_map = sanitize_features_for_map(buffer_features)
+            if not map_features:
+                st.info("No segments available to display on map.")
             fmap = create_map(
                 ndvi_overlay=ndvi_overlay,
-                line_features=valid_features,
+                line_features=map_features,
                 buffer_features=buffer_features_for_map,
                 show_buffers=show_buffers,
                 opacity=opacity,

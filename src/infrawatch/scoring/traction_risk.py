@@ -8,8 +8,12 @@ from typing import Any
 
 import numpy as np
 import rasterio
+from pyproj import CRS, Transformer
+from rasterio.errors import WindowError
 from rasterio.features import rasterize
+from rasterio.windows import Window, from_bounds
 from shapely.geometry import shape
+from shapely.ops import transform as shapely_transform
 
 
 def _load_geojson(path: Path) -> dict[str, Any]:
@@ -42,11 +46,119 @@ def _risk_score(mean_ndvi: float, p90_ndvi: float, pct_above_0_6: float) -> floa
     return float(np.clip((1.0 - vegetation_score) * 100.0, 0.0, 100.0))
 
 
+def _normalize_crs(value: Any) -> CRS | None:
+    if value is None:
+        return None
+    return CRS.from_user_input(value)
+
+
+def _detect_geojson_crs(payload: dict[str, Any]) -> CRS | None:
+    crs_payload = payload.get("crs")
+    if isinstance(crs_payload, dict):
+        props = crs_payload.get("properties") or {}
+        name = props.get("name")
+        if name:
+            return _normalize_crs(name)
+    return None
+
+
+def reproject_shapely_geom(geom, src_crs: Any, dst_crs: Any):
+    src = _normalize_crs(src_crs)
+    dst = _normalize_crs(dst_crs)
+    if src is None or dst is None or src == dst:
+        return geom
+    transformer = Transformer.from_crs(src, dst, always_xy=True)
+    return shapely_transform(transformer.transform, geom)
+
+
+def _no_data_stats() -> dict[str, Any]:
+    return {
+        "count": 0,
+        "mean_ndvi": float("nan"),
+        "p90_ndvi": float("nan"),
+        "pct_above_0_6": float("nan"),
+        "data_status": "NO_DATA",
+    }
+
+
+def _sample_ndvi_for_line_dataset(
+    dataset: rasterio.io.DatasetReader,
+    line_geom,
+    buffer_m: float,
+    *,
+    line_crs: Any = None,
+) -> dict[str, Any]:
+    if line_geom is None or line_geom.is_empty:
+        return _no_data_stats()
+
+    ndvi_crs = dataset.crs
+    ndvi_geom = reproject_shapely_geom(line_geom, line_crs, ndvi_crs)
+    buffered = ndvi_geom.buffer(buffer_m) if buffer_m > 0 else ndvi_geom
+    if buffered.is_empty:
+        return _no_data_stats()
+
+    bounds = buffered.bounds
+    try:
+        window = from_bounds(*bounds, transform=dataset.transform)
+        window = window.intersection(Window(0, 0, dataset.width, dataset.height))
+    except WindowError:
+        return _no_data_stats()
+
+    if window.width <= 0 or window.height <= 0:
+        return _no_data_stats()
+
+    data = dataset.read(1, window=window, masked=True).astype(np.float32)
+    mask = rasterize(
+        [(buffered, 1)],
+        out_shape=(int(window.height), int(window.width)),
+        transform=dataset.window_transform(window),
+        fill=0,
+        dtype="uint8",
+    ).astype(bool)
+
+    if data.mask is np.ma.nomask:
+        combined_mask = ~mask
+    else:
+        combined_mask = np.logical_or(data.mask, ~mask)
+    values = np.ma.array(data, mask=combined_mask)
+    values = np.ma.masked_invalid(values)
+
+    if values.count() == 0:
+        return _no_data_stats()
+
+    mean_ndvi = float(values.mean())
+    p90_ndvi = float(np.percentile(values.compressed(), 90))
+    pct_above = float(np.mean(values.compressed() > 0.6))
+    return {
+        "count": int(values.count()),
+        "mean_ndvi": mean_ndvi,
+        "p90_ndvi": p90_ndvi,
+        "pct_above_0_6": pct_above,
+        "data_status": "OK",
+    }
+
+
+def sample_ndvi_for_line(
+    ndvi_path: Path | str,
+    line_geom,
+    buffer_m: float,
+    step_m: float | None = None,
+    *,
+    line_crs: Any = None,
+) -> dict[str, Any]:
+    """Sample NDVI values within a buffered line corridor using windowed reads."""
+    _ = step_m
+    ndvi_path = Path(ndvi_path)
+    with rasterio.open(ndvi_path) as dataset:
+        return _sample_ndvi_for_line_dataset(dataset, line_geom, buffer_m, line_crs=line_crs)
+
+
 def score_traction_segments(
     ndvi_path: Path | str,
     lines_path: Path | str,
     *,
     buffer_m: float = 20.0,
+    lines_crs: Any = None,
 ) -> list[dict[str, Any]]:
     """Score traction risk for each LineString feature in a GeoJSON."""
     ndvi_path = Path(ndvi_path)
@@ -57,30 +169,20 @@ def score_traction_segments(
 
     results: list[dict[str, Any]] = []
 
-    with rasterio.open(ndvi_path) as dataset:
-        ndvi = dataset.read(1).astype(np.float32)
-        transform = dataset.transform
+    resolved_lines_crs = _normalize_crs(lines_crs) or _detect_geojson_crs(lines_payload)
 
+    with rasterio.open(ndvi_path) as dataset:
         for idx, feature in enumerate(features, start=1):
             geom = shape(feature.get("geometry"))
-            buffered = geom.buffer(buffer_m)
-            mask = rasterize(
-                [(buffered, 1)],
-                out_shape=ndvi.shape,
-                transform=transform,
-                fill=0,
-                dtype="uint8",
+            stats = _sample_ndvi_for_line_dataset(
+                dataset,
+                geom,
+                buffer_m,
+                line_crs=resolved_lines_crs or dataset.crs,
             )
-            values = ndvi[mask == 1]
-            values = values[~np.isnan(values)]
-            if values.size == 0:
-                mean_ndvi = float("nan")
-                p90_ndvi = float("nan")
-                pct_above = float("nan")
-            else:
-                mean_ndvi = float(np.mean(values))
-                p90_ndvi = float(np.percentile(values, 90))
-                pct_above = float(np.mean(values > 0.6))
+            mean_ndvi = stats["mean_ndvi"]
+            p90_ndvi = stats["p90_ndvi"]
+            pct_above = stats["pct_above_0_6"]
 
             risk_score = _risk_score(mean_ndvi, p90_ndvi, pct_above)
             risk_category = _risk_category(risk_score)
@@ -94,6 +196,8 @@ def score_traction_segments(
                     "risk_score": risk_score,
                     "risk_category": risk_category,
                     "buffer_m": buffer_m,
+                    "data_status": stats["data_status"],
+                    "sample_count": stats["count"],
                 }
             )
 
