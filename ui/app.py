@@ -41,6 +41,8 @@ LOG_PATH = Path("ui_runtime.log")
 DEFAULT_UTM_EPSG = 32633
 LONGITUDE_LIMIT_DEG = 180
 LATITUDE_LIMIT_DEG = 90
+DEMO_SEGMENT_HALF_LENGTH_M = 150.0
+NDVI_SAMPLE_WINDOW_PIXELS = 5
 
 
 def _get_logger() -> logging.Logger:
@@ -206,14 +208,14 @@ def prepare_lines_for_scoring(
 
 def load_ndvi_overlay(ndvi_path: Path) -> tuple[str, list[list[float]], Any] | None:
     logger = _get_logger()
-    try:
-        import rasterio
-        from matplotlib import pyplot as plt
-        from rasterio.enums import Resampling
-        from rasterio.transform import Affine, array_bounds
-        from rasterio.warp import transform_bounds
-        from rasterio.crs import CRS
+    import rasterio
+    from matplotlib import pyplot as plt
+    from rasterio.enums import Resampling
+    from rasterio.transform import Affine, array_bounds
+    from rasterio.warp import transform_bounds
+    from rasterio.crs import CRS
 
+    try:
         with rasterio.open(ndvi_path) as dataset:
             scale = min(1.0, 1024 / max(dataset.width, dataset.height))
             new_width = max(1, int(dataset.width * scale))
@@ -254,17 +256,59 @@ def load_ndvi_overlay(ndvi_path: Path) -> tuple[str, list[list[float]], Any] | N
         return None
 
 
-def read_ndvi_crs(ndvi_path: Path):
+def read_ndvi_metadata(ndvi_path: Path) -> tuple[Any, Any, list[list[float]] | None]:
+    """Return NDVI CRS, bounds in native CRS, and bounds in EPSG:4326."""
     logger = _get_logger()
-    try:
-        import rasterio
+    import rasterio
+    from rasterio.crs import CRS
+    from rasterio.warp import transform_bounds
 
+    try:
         with rasterio.open(ndvi_path) as dataset:
-            if dataset.crs:
-                return dataset.crs
+            bounds = dataset.bounds
+            crs = dataset.crs
+        if crs is None:
+            return None, bounds, None
+        wgs_bounds = transform_bounds(crs, CRS.from_epsg(4326), *bounds)
+        bounds_list = [[wgs_bounds[1], wgs_bounds[0]], [wgs_bounds[3], wgs_bounds[2]]]
+        return crs, bounds, bounds_list
     except Exception as exc:  # noqa: BLE001
-        st.error(f"Failed to read NDVI CRS: {exc}")
-        logger.exception("ndvi_crs_failed path=%s", ndvi_path)
+        st.error(f"Failed to read NDVI metadata: {exc}")
+        logger.exception("ndvi_metadata_failed path=%s", ndvi_path)
+    return None, None, None
+
+
+def generate_demo_segment(ndvi_path: Path, output_path: Path) -> Path | None:
+    """Generate a short demo LineString centered in the NDVI bounds."""
+    import rasterio
+
+    try:
+        with rasterio.open(ndvi_path) as dataset:
+            bounds = dataset.bounds
+        center_x = (bounds.left + bounds.right) / 2
+        center_y = (bounds.bottom + bounds.top) / 2
+        coords = [
+            [center_x - DEMO_SEGMENT_HALF_LENGTH_M, center_y],
+            [center_x + DEMO_SEGMENT_HALF_LENGTH_M, center_y],
+        ]
+        payload = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {"segment_id": 1},
+                    "geometry": {
+                        "type": "LineString",
+                        "coordinates": coords,
+                    },
+                }
+            ],
+        }
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return output_path
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Failed to generate demo segment: {exc}")
     return None
 
 
@@ -289,6 +333,20 @@ def iter_coordinates(coordinates: Any) -> Iterable[Sequence[float]]:
     else:
         for item in coordinates:
             yield from iter_coordinates(item)
+
+
+def bounds_from_features(features: list[dict[str, Any]]) -> list[list[float]] | None:
+    lats: list[float] = []
+    lons: list[float] = []
+    for feature in features:
+        geometry = feature.get("geometry") or {}
+        for coord in iter_coordinates(geometry.get("coordinates")):
+            if coord and len(coord) >= 2:
+                lons.append(coord[0])
+                lats.append(coord[1])
+    if not lats or not lons:
+        return None
+    return [[min(lats), min(lons)], [max(lats), max(lons)]]
 
 
 def build_results_table(results: list[dict[str, Any]]) -> pd.DataFrame:
@@ -419,28 +477,13 @@ def create_map(
     buffer_features: list[dict[str, Any]],
     show_buffers: bool,
     opacity: float,
+    fit_bounds: list[list[float]] | None,
 ) -> folium.Map:
-    if ndvi_overlay:
-        _, bounds, _ = ndvi_overlay
-        center_lat = (bounds[0][0] + bounds[1][0]) / 2
-        center_lon = (bounds[0][1] + bounds[1][1]) / 2
-    elif line_features:
-        lats = []
-        lons = []
-        for feature in line_features:
-            for coord in iter_coordinates(feature["geometry"].get("coordinates", [])):
-                if len(coord) >= 2:
-                    lons.append(coord[0])
-                    lats.append(coord[1])
-        if lats and lons:
-            center_lat = (min(lats) + max(lats)) / 2
-            center_lon = (min(lons) + max(lons)) / 2
-        else:
-            center_lat, center_lon = 0, 0
-        bounds = None
+    if fit_bounds:
+        center_lat = (fit_bounds[0][0] + fit_bounds[1][0]) / 2
+        center_lon = (fit_bounds[0][1] + fit_bounds[1][1]) / 2
     else:
         center_lat, center_lon = 0, 0
-        bounds = None
 
     fmap = folium.Map(location=[center_lat, center_lon], zoom_start=10, control_scale=True)
 
@@ -508,7 +551,61 @@ def create_map(
         ).add_to(fmap)
 
     folium.LayerControl(collapsed=False).add_to(fmap)
+    if fit_bounds:
+        fmap.fit_bounds(fit_bounds)
     return fmap
+
+
+def extract_first_line_centroid(
+    lines_payload: dict[str, Any],
+    source_crs,
+    ndvi_crs,
+) -> tuple[float, float] | None:
+    from shapely.geometry import shape
+
+    features = lines_payload.get("features", [])
+    if not features:
+        return None
+    geometry = features[0].get("geometry")
+    if geometry is None:
+        return None
+    geom = shape(geometry)
+    transformer = to_crs_transformer(source_crs, ndvi_crs)
+    ndvi_geom = transform_geometry(geom, transformer)
+    centroid = ndvi_geom.centroid
+    return centroid.x, centroid.y
+
+
+def read_ndvi_sample_stats(ndvi_path: Path, center_x: float, center_y: float) -> dict[str, Any]:
+    """Return NDVI stats for a small pixel window around the center."""
+    import rasterio
+    from rasterio.windows import Window
+
+    with rasterio.open(ndvi_path) as dataset:
+        row, col = dataset.index(center_x, center_y)
+        half = NDVI_SAMPLE_WINDOW_PIXELS // 2
+        col_off = max(col - half, 0)
+        row_off = max(row - half, 0)
+        width = min(NDVI_SAMPLE_WINDOW_PIXELS, dataset.width - col_off)
+        height = min(NDVI_SAMPLE_WINDOW_PIXELS, dataset.height - row_off)
+        window = Window(col_off, row_off, width, height)
+        values = dataset.read(1, window=window, masked=True).astype(np.float32)
+    values = np.ma.masked_invalid(values)
+    if values.count() == 0:
+        return {
+            "window": [int(col_off), int(row_off), int(width), int(height)],
+            "count": 0,
+            "min": None,
+            "max": None,
+            "mean": None,
+        }
+    return {
+        "window": [int(col_off), int(row_off), int(width), int(height)],
+        "count": int(values.count()),
+        "min": float(values.min()),
+        "max": float(values.max()),
+        "mean": float(values.mean()),
+    }
 
 
 def main() -> None:
@@ -529,6 +626,10 @@ def main() -> None:
     ndvi_default = str(ndvi_detection.path) if ndvi_detection.path else ""
     lines_default = str(Path("tests/data/demo_lines.geojson"))
     risk_default = "traction_risk.json" if Path("traction_risk.json").exists() else ""
+    demo_segment_path = Path("satellite_data/demo_segment.geojson")
+
+    if "lines_path" not in st.session_state:
+        st.session_state["lines_path"] = lines_default
 
     with st.sidebar:
         st.header("Inputs")
@@ -542,7 +643,16 @@ def main() -> None:
                 "No NDVI found under satellite_data/raw/s2/**/ndvi.tif. "
                 "Run scripts/compute_ndvi.py to generate one."
             )
-        lines_path_input = st.text_input("Traction lines GeoJSON path", value=lines_default)
+        if st.button("Generate demo segment inside NDVI extent"):
+            ndvi_path_candidate = Path(ndvi_path_input).expanduser()
+            if ndvi_path_candidate.exists():
+                generated = generate_demo_segment(ndvi_path_candidate, demo_segment_path)
+                if generated:
+                    st.session_state["lines_path"] = str(generated)
+                    st.success(f"Generated demo segment at {generated}")
+            else:
+                st.warning("NDVI path not found; unable to generate demo segment.")
+        lines_path_input = st.text_input("Traction lines GeoJSON path", key="lines_path")
         risk_path_input = st.text_input("Risk JSON path", value=risk_default)
         buffer_m = st.slider("Buffer distance (meters)", min_value=1, max_value=100, value=20)
         opacity = st.slider("NDVI overlay opacity", min_value=0.1, max_value=1.0, value=0.6)
@@ -557,9 +667,11 @@ def main() -> None:
     ndvi_overlay = None
     ndvi_crs = None
     lines_crs = None
+    ndvi_bounds = None
+    ndvi_bounds_wgs84 = None
 
     if ndvi_path_input and ndvi_path.exists():
-        ndvi_crs = read_ndvi_crs(ndvi_path)
+        ndvi_crs, ndvi_bounds, ndvi_bounds_wgs84 = read_ndvi_metadata(ndvi_path)
 
     if enable_ndvi_overlay:
         logger.info("ndvi_overlay_enabled path=%s", ndvi_path)
@@ -567,6 +679,8 @@ def main() -> None:
             ndvi_overlay = load_ndvi_overlay(ndvi_path)
             if ndvi_overlay:
                 ndvi_crs = ndvi_overlay[2]
+                if not ndvi_bounds_wgs84:
+                    ndvi_bounds_wgs84 = ndvi_overlay[1]
         else:
             st.warning("NDVI path not found; overlay disabled.")
 
@@ -609,6 +723,33 @@ def main() -> None:
         st.error(f"Failed to prepare risk table: {exc}")
         results_df = pd.DataFrame()
 
+    if not results_df.empty and (results_df["data_status"] == "NO_DATA").any():
+        st.warning(
+            "NDVI returned NO_DATA for one or more segments. This usually means the segment "
+            "geometry does not overlap the NDVI raster or uses a mismatched CRS."
+        )
+        if ndvi_bounds is not None:
+            debug_payload: dict[str, Any] = {
+                "ndvi_bounds_native": {
+                    "left": ndvi_bounds.left,
+                    "bottom": ndvi_bounds.bottom,
+                    "right": ndvi_bounds.right,
+                    "top": ndvi_bounds.top,
+                },
+                "ndvi_bounds_wgs84": ndvi_bounds_wgs84,
+            }
+            if lines_payload and ndvi_path.exists():
+                source_crs = lines_crs or detect_geojson_crs(lines_payload, ndvi_crs)
+                centroid = extract_first_line_centroid(lines_payload, source_crs, ndvi_crs or source_crs)
+                if centroid:
+                    sample_stats = read_ndvi_sample_stats(ndvi_path, centroid[0], centroid[1])
+                    debug_payload["sample_centroid_ndvi_crs"] = {
+                        "x": centroid[0],
+                        "y": centroid[1],
+                    }
+                    debug_payload["sample_window_stats"] = sample_stats
+            st.code(json.dumps(debug_payload, indent=2))
+
     if lines_payload:
         try:
             source_crs = lines_crs or detect_geojson_crs(lines_payload, ndvi_crs)
@@ -644,6 +785,11 @@ def main() -> None:
                 if (feature.get("properties") or {}).get("data_status") != "NO_DATA"
             ]
             valid_features = sanitize_features_for_map(valid_features)
+            fit_bounds = bounds_from_features(valid_features)
+            if fit_bounds is None and ndvi_bounds_wgs84:
+                fit_bounds = ndvi_bounds_wgs84
+            if fit_bounds is None:
+                fit_bounds = bounds_from_features(line_features)
             valid_segment_ids = {
                 (feature.get("properties") or {}).get("segment_id") for feature in valid_features
             }
@@ -660,6 +806,7 @@ def main() -> None:
                 buffer_features=buffer_features_for_map,
                 show_buffers=show_buffers,
                 opacity=opacity,
+                fit_bounds=fit_bounds,
             )
             st_folium(fmap, width=800, height=600)
         except Exception as exc:  # noqa: BLE001
