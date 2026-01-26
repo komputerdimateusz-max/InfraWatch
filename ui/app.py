@@ -606,7 +606,7 @@ def read_ndvi_sample_stats(ndvi_path: Path, center_x: float, center_y: float) ->
             "width": int(width),
             "height": int(height),
         }
-        st.debug(
+        st.caption(
             {
                 "ndvi_sample_centroid": {"x": center_x, "y": center_y},
                 "ndvi_raster_size": {"width": dataset.width, "height": dataset.height},
