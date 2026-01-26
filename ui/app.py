@@ -16,7 +16,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Sequence
 
 import folium
 import numpy as np
@@ -24,7 +24,10 @@ import pandas as pd
 import rasterio
 import streamlit as st
 from folium.features import GeoJsonTooltip
+from pyproj import Transformer
 from rasterio.crs import CRS
+from rasterio.enums import Resampling
+from rasterio.transform import Affine, array_bounds
 from rasterio.warp import transform_bounds
 from shapely.geometry import mapping, shape
 from shapely.ops import transform as shapely_transform
@@ -107,7 +110,6 @@ def detect_geojson_crs(payload: dict[str, Any]) -> CRS:
 def to_crs_transformer(source: CRS, target: CRS):
     if source == target:
         return None
-    from pyproj import Transformer
 
     return Transformer.from_crs(source, target, always_xy=True)
 
@@ -143,28 +145,71 @@ def prepare_lines_for_scoring(
     return Path(temp.name)
 
 
-def load_ndvi_overlay(ndvi_path: Path) -> tuple[str, list[list[float]], CRS]:
+def load_ndvi_preview(
+    ndvi_path: Path, max_size: int = 1024
+) -> tuple[np.ndarray, tuple[float, float, float, float], Affine, CRS]:
     with rasterio.open(ndvi_path) as dataset:
-        ndvi = dataset.read(1).astype(np.float32)
+        scale = min(1.0, max_size / max(dataset.width, dataset.height))
+        new_width = max(1, int(dataset.width * scale))
+        new_height = max(1, int(dataset.height * scale))
+
+        preview = dataset.read(
+            1,
+            out_shape=(new_height, new_width),
+            resampling=Resampling.bilinear,
+            masked=True,
+        ).astype(np.float32)
         if dataset.nodata is not None:
-            ndvi = np.where(ndvi == dataset.nodata, np.nan, ndvi)
+            preview = np.ma.masked_where(preview == dataset.nodata, preview)
+        preview = np.ma.masked_invalid(preview)
 
-        masked = np.ma.masked_invalid(ndvi)
+        scale_x = dataset.width / new_width
+        scale_y = dataset.height / new_height
+        preview_transform = dataset.transform * Affine.scale(scale_x, scale_y)
+        south, west, north, east = array_bounds(new_height, new_width, preview_transform)
+        bounds = (west, south, east, north)
+        return preview, bounds, preview_transform, dataset.crs
 
-        from matplotlib import pyplot as plt
 
-        colormap = plt.get_cmap("viridis").copy()
-        colormap.set_bad(alpha=0)
-        buf = io.BytesIO()
-        plt.imsave(buf, masked, cmap=colormap, format="png")
-        buf.seek(0)
-        encoded = base64.b64encode(buf.read()).decode("ascii")
-        data_url = f"data:image/png;base64,{encoded}"
+def load_ndvi_overlay(ndvi_path: Path) -> tuple[str, list[list[float]], CRS]:
+    preview, bounds, _, ndvi_crs = load_ndvi_preview(ndvi_path)
 
-        bounds = dataset.bounds
-        wgs_bounds = transform_bounds(dataset.crs, CRS.from_epsg(4326), *bounds)
-        bounds_list = [[wgs_bounds[1], wgs_bounds[0]], [wgs_bounds[3], wgs_bounds[2]]]
-        return data_url, bounds_list, dataset.crs
+    from matplotlib import pyplot as plt
+
+    colormap = plt.get_cmap("viridis").copy()
+    colormap.set_bad(alpha=0)
+    buf = io.BytesIO()
+    plt.imsave(buf, preview, cmap=colormap, format="png")
+    buf.seek(0)
+    encoded = base64.b64encode(buf.read()).decode("ascii")
+    data_url = f"data:image/png;base64,{encoded}"
+
+    wgs_bounds = transform_bounds(ndvi_crs, CRS.from_epsg(4326), *bounds)
+    bounds_list = [[wgs_bounds[1], wgs_bounds[0]], [wgs_bounds[3], wgs_bounds[2]]]
+    return data_url, bounds_list, ndvi_crs
+
+
+def _coordinates_to_lists(value: Any) -> Any:
+    if isinstance(value, (list, tuple)):
+        return [_coordinates_to_lists(item) for item in value]
+    return value
+
+
+def normalize_geojson_coordinates(geometry: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(geometry)
+    if "coordinates" in geometry:
+        normalized["coordinates"] = _coordinates_to_lists(geometry["coordinates"])
+    return normalized
+
+
+def iter_coordinates(coordinates: Any) -> Iterable[Sequence[float]]:
+    if not isinstance(coordinates, (list, tuple)):
+        return
+    if coordinates and isinstance(coordinates[0], (int, float)):
+        yield coordinates
+    else:
+        for item in coordinates:
+            yield from iter_coordinates(item)
 
 
 def build_results_table(results: list[dict[str, Any]]) -> pd.DataFrame:
@@ -206,7 +251,8 @@ def build_map_features(
     if not results_df.empty and "segment_id" in results_df.columns:
         results_by_id = results_df.set_index("segment_id").to_dict(orient="index")
 
-    to_wgs84 = to_crs_transformer(source_crs, CRS.from_epsg(4326))
+    map_source_crs = ndvi_crs or source_crs
+    to_wgs84 = to_crs_transformer(map_source_crs, CRS.from_epsg(4326))
     to_ndvi = to_crs_transformer(source_crs, ndvi_crs) if ndvi_crs else None
     ndvi_to_wgs84 = to_crs_transformer(ndvi_crs, CRS.from_epsg(4326)) if ndvi_crs else None
 
@@ -229,7 +275,7 @@ def build_map_features(
         line_features.append(
             {
                 "type": "Feature",
-                "geometry": mapping(wgs_geom),
+                "geometry": normalize_geojson_coordinates(mapping(wgs_geom)),
                 "properties": properties,
             }
         )
@@ -241,7 +287,7 @@ def build_map_features(
             buffer_features.append(
                 {
                     "type": "Feature",
-                    "geometry": mapping(buffer_wgs),
+                    "geometry": normalize_geojson_coordinates(mapping(buffer_wgs)),
                     "properties": {"segment_id": idx},
                 }
             )
@@ -261,8 +307,18 @@ def create_map(
         center_lat = (bounds[0][0] + bounds[1][0]) / 2
         center_lon = (bounds[0][1] + bounds[1][1]) / 2
     elif line_features:
-        sample = line_features[0]["geometry"]["coordinates"][0]
-        center_lon, center_lat = sample
+        lats = []
+        lons = []
+        for feature in line_features:
+            for coord in iter_coordinates(feature["geometry"].get("coordinates", [])):
+                if len(coord) >= 2:
+                    lons.append(coord[0])
+                    lats.append(coord[1])
+        if lats and lons:
+            center_lat = (min(lats) + max(lats)) / 2
+            center_lon = (min(lons) + max(lons)) / 2
+        else:
+            center_lat, center_lon = 0, 0
         bounds = None
     else:
         center_lat, center_lon = 0, 0
