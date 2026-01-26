@@ -64,14 +64,27 @@ def reproject_shapely_geom(geom, src_crs: Any, dst_crs: Any):
     return shapely_transform(transformer.transform, geom)
 
 
-def _no_data_stats() -> dict[str, Any]:
+def _no_data_stats(reason: str | None = None) -> dict[str, Any]:
     return {
         "count": 0,
         "mean_ndvi": float("nan"),
         "p90_ndvi": float("nan"),
         "pct_above_0_6": float("nan"),
         "data_status": "NO_DATA",
+        "data_status_detail": reason,
     }
+
+
+def _bounds_overlap(
+    bounds: tuple[float, float, float, float],
+    other: tuple[float, float, float, float],
+) -> bool:
+    return not (
+        bounds[2] <= other[0]
+        or bounds[0] >= other[2]
+        or bounds[3] <= other[1]
+        or bounds[1] >= other[3]
+    )
 
 
 def _sample_ndvi_for_line_dataset(
@@ -82,29 +95,31 @@ def _sample_ndvi_for_line_dataset(
     line_crs: Any = None,
 ) -> dict[str, Any]:
     if line_geom is None or line_geom.is_empty:
-        return _no_data_stats()
+        return _no_data_stats("Empty geometry")
 
     ndvi_crs = dataset.crs
     ndvi_geom = reproject_shapely_geom(line_geom, line_crs, ndvi_crs)
     buffered = ndvi_geom.buffer(buffer_m) if buffer_m > 0 else ndvi_geom
     if buffered.is_empty:
-        return _no_data_stats()
+        return _no_data_stats("Empty geometry after buffering")
 
     bounds = buffered.bounds
+    if not _bounds_overlap(bounds, dataset.bounds):
+        return _no_data_stats("Geometry outside NDVI extent")
     try:
         window = from_bounds(*bounds, transform=dataset.transform)
         window = window.intersection(Window(0, 0, dataset.width, dataset.height))
         # Round to pixel grid so raster reads and masks align exactly.
         window = window.round_offsets().round_lengths()
     except WindowError:
-        return _no_data_stats()
+        return _no_data_stats("Geometry outside NDVI extent")
 
     if window.width < 1 or window.height < 1:
-        return _no_data_stats()
+        return _no_data_stats("Geometry outside NDVI extent")
 
     data = dataset.read(1, window=window, masked=True).astype(np.float32)
     if data.size == 0:
-        return _no_data_stats()
+        return _no_data_stats("No NDVI samples in window")
     mask = rasterize(
         [(buffered, 1)],
         out_shape=data.shape,
@@ -121,7 +136,7 @@ def _sample_ndvi_for_line_dataset(
     values = np.ma.masked_invalid(values)
 
     if values.count() == 0:
-        return _no_data_stats()
+        return _no_data_stats("No NDVI samples in buffer")
 
     mean_ndvi = float(values.mean())
     p90_ndvi = float(np.percentile(values.compressed(), 90))
