@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from .models import IngestionRequest, SceneMetadata, SceneSummary
@@ -18,6 +19,9 @@ STAC_ENDPOINT = "https://stac.dataspace.copernicus.eu/v1/search"
 # CDSE STAC collection id for Sentinel-2 Level-2A
 COLLECTION_ID = "sentinel-2-l2a"
 DOWNLOAD_TIMEOUT = 120
+
+# CDSE HTTP download gateway for EO Data (maps eodata bucket paths to HTTPS)
+CDSE_DOWNLOAD_BASE = "https://download.dataspace.copernicus.eu/"
 
 logger = logging.getLogger(__name__)
 
@@ -52,22 +56,30 @@ class CopernicusClient:
 
     def download_scene(self, scene: SceneSummary, destination_dir: Path) -> Path:
         destination_dir.mkdir(parents=True, exist_ok=True)
-        filename = select_asset_filename(scene.download_url, f"{scene.product_id}.zip")
+        filename = select_asset_filename(scene.download_url, f"{scene.product_id}.bin")
         output_path = destination_dir / filename
+
         logger.info("Downloading %s -> %s", scene.product_id, output_path)
-        headers = {}
+
+        headers: dict[str, str] = {}
         if self.auth:
             headers["Authorization"] = self.auth.header()
+
         request = Request(scene.download_url, headers=headers)
+
         try:
             with urlopen(request, timeout=DOWNLOAD_TIMEOUT) as response:
                 with output_path.open("wb") as handle:
-                    while chunk := response.read(1024 * 1024):
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
                         handle.write(chunk)
         except HTTPError as exc:
             raise RuntimeError(http_error_message(exc, scene.download_url)) from exc
         except URLError as exc:
             raise RuntimeError(f"Network error while downloading {scene.download_url}: {exc}") from exc
+
         return output_path
 
 
@@ -105,13 +117,18 @@ def scene_from_feature(feature: Mapping[str, Any]) -> SceneSummary:
     if not dt_raw:
         raise RuntimeError("Scene is missing acquisition datetime.")
     acquisition_dt = parse_datetime(dt_raw)
+
     product_id = props.get("productIdentifier") or feature.get("id") or "unknown"
     title = props.get("title") or product_id
     cloud_cover = props.get("eo:cloud_cover")
+
     bbox = feature.get("bbox") or []
     if len(bbox) != 4:
         raise RuntimeError("Scene is missing a valid bbox.")
-    download_url = select_download_url(feature.get("assets", {}))
+
+    raw_url = select_download_url(feature.get("assets", {}))
+    download_url = normalize_download_url(raw_url)
+
     return SceneSummary(
         product_id=product_id,
         title=title,
@@ -132,6 +149,25 @@ def select_download_url(assets: Mapping[str, Any]) -> str:
         if isinstance(asset, Mapping) and "href" in asset:
             return asset["href"]
     raise RuntimeError("No downloadable asset found in STAC item.")
+
+
+def normalize_download_url(href: str) -> str:
+    """
+    CDSE STAC often returns S3 hrefs, e.g.:
+      s3://eodata/Sentinel-2/.../T33UWU_..._AOT_10m.jp2
+
+    urllib cannot handle s3://. For MVP we map eodata bucket paths to the CDSE HTTPS gateway:
+      https://download.dataspace.copernicus.eu/Sentinel-2/.../file.jp2
+
+    This keeps dependencies minimal (no boto3). If CDSE changes gateway rules, this function is
+    the single place to update.
+    """
+    if href.startswith("s3://eodata/"):
+        rel = href[len("s3://eodata/") :]
+        # ensure URL-safe path (keep slashes)
+        rel_q = quote(rel, safe="/")
+        return CDSE_DOWNLOAD_BASE + rel_q
+    return href
 
 
 def parse_datetime(value: str) -> datetime:
