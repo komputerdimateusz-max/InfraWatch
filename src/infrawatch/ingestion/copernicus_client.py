@@ -251,6 +251,7 @@ def scene_from_feature(feature: Mapping[str, Any]) -> SceneSummary:
     if len(bbox) != 4:
         raise RuntimeError("Scene is missing a valid bbox.")
 
+logger.info("STAC assets keys: %s", list(feature.get("assets", {}).keys()))
     download_url = select_download_url(feature.get("assets", {}))
 
     return SceneSummary(
