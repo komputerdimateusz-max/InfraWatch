@@ -167,6 +167,27 @@ def to_crs_transformer(source, target):
     return Transformer.from_crs(source, target, always_xy=True)
 
 
+def transform_bounds_always_xy(
+    source, target, bounds: tuple[float, float, float, float]
+) -> tuple[float, float, float, float]:
+    """Transform bounds using explicit x/y axis order for reliable lon/lat results."""
+    from pyproj import Transformer
+
+    source = normalize_crs(source)
+    target = normalize_crs(target)
+
+    if source is None or target is None:
+        raise ValueError("CRS required to transform bounds.")
+    if source == target:
+        return bounds
+
+    left, bottom, right, top = bounds
+    transformer = Transformer.from_crs(source, target, always_xy=True)
+    minx, miny = transformer.transform(left, bottom)
+    maxx, maxy = transformer.transform(right, top)
+    return (min(minx, maxx), min(miny, maxy), max(minx, maxx), max(miny, maxy))
+
+
 def transform_geometry(geom, transformer) -> Any:
     from shapely.ops import transform as shapely_transform
 
@@ -211,7 +232,6 @@ def load_ndvi_overlay(ndvi_path: Path) -> tuple[str, list[list[float]], Any] | N
     from matplotlib import pyplot as plt
     from rasterio.enums import Resampling
     from rasterio.transform import Affine, array_bounds
-    from rasterio.warp import transform_bounds
     from rasterio.crs import CRS
 
     try:
@@ -245,7 +265,7 @@ def load_ndvi_overlay(ndvi_path: Path) -> tuple[str, list[list[float]], Any] | N
         encoded = base64.b64encode(buf.read()).decode("ascii")
         data_url = f"data:image/png;base64,{encoded}"
 
-        wgs_bounds = transform_bounds(ndvi_crs, CRS.from_epsg(4326), *bounds, always_xy=True)
+        wgs_bounds = transform_bounds_always_xy(ndvi_crs, CRS.from_epsg(4326), bounds)
         bounds_list = [[wgs_bounds[0], wgs_bounds[1]], [wgs_bounds[2], wgs_bounds[3]]]
         logger.info("ndvi_overlay_loaded path=%s", ndvi_path)
         return data_url, bounds_list, ndvi_crs
@@ -260,7 +280,6 @@ def read_ndvi_metadata(ndvi_path: Path) -> tuple[Any, Any, list[list[float]] | N
     logger = _get_logger()
     import rasterio
     from rasterio.crs import CRS
-    from rasterio.warp import transform_bounds
 
     try:
         with rasterio.open(ndvi_path) as dataset:
@@ -268,7 +287,7 @@ def read_ndvi_metadata(ndvi_path: Path) -> tuple[Any, Any, list[list[float]] | N
             crs = dataset.crs
         if crs is None:
             return None, bounds, None
-        wgs_bounds = transform_bounds(crs, CRS.from_epsg(4326), *bounds, always_xy=True)
+        wgs_bounds = transform_bounds_always_xy(crs, CRS.from_epsg(4326), bounds)
         bounds_list = [[wgs_bounds[0], wgs_bounds[1]], [wgs_bounds[2], wgs_bounds[3]]]
         return crs, bounds, bounds_list
     except Exception as exc:  # noqa: BLE001
@@ -281,7 +300,6 @@ def generate_demo_segment(ndvi_path: Path, output_path: Path) -> Path | None:
     """Generate a short demo LineString centered in the NDVI bounds."""
     import rasterio
     from pyproj import CRS
-    from rasterio.warp import transform_bounds
 
     try:
         with rasterio.open(ndvi_path) as dataset:
@@ -289,7 +307,7 @@ def generate_demo_segment(ndvi_path: Path, output_path: Path) -> Path | None:
             ndvi_crs = dataset.crs
         if ndvi_crs is None:
             raise ValueError("NDVI CRS unavailable; cannot generate demo segment.")
-        wgs_bounds = transform_bounds(ndvi_crs, CRS.from_epsg(4326), *bounds, always_xy=True)
+        wgs_bounds = transform_bounds_always_xy(ndvi_crs, CRS.from_epsg(4326), bounds)
         min_lon, min_lat, max_lon, max_lat = wgs_bounds
         mid_lat = (min_lat + max_lat) / 2
         span_lon = max_lon - min_lon
