@@ -389,6 +389,30 @@ def first_reprojected_coordinate(features: list[dict[str, Any]]) -> Sequence[flo
     return None
 
 
+def sanitize_properties_for_map(properties: dict[str, Any]) -> dict[str, Any]:
+    sanitized: dict[str, Any] = {}
+    for key, value in properties.items():
+        if value is None:
+            sanitized[key] = "N/A"
+        elif isinstance(value, float) and np.isnan(value):
+            sanitized[key] = "N/A"
+        elif pd.isna(value):
+            sanitized[key] = "N/A"
+        else:
+            sanitized[key] = value
+    return sanitized
+
+
+def sanitize_features_for_map(features: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sanitized_features = []
+    for feature in features:
+        properties = feature.get("properties") or {}
+        sanitized = dict(feature)
+        sanitized["properties"] = sanitize_properties_for_map(properties)
+        sanitized_features.append(sanitized)
+    return sanitized_features
+
+
 def create_map(
     ndvi_overlay: tuple[str, list[list[float]], CRS] | None,
     line_features: list[dict[str, Any]],
@@ -465,9 +489,10 @@ def create_map(
         localize=True,
     )
 
-    folium.GeoJson(line_features, name="Traction Segments", style_function=style_line, tooltip=tooltip).add_to(
-        fmap
-    )
+    if line_features:
+        folium.GeoJson(line_features, name="Traction Segments", style_function=style_line, tooltip=tooltip).add_to(
+            fmap
+        )
 
     if show_buffers and buffer_features:
         folium.GeoJson(
@@ -613,10 +638,26 @@ def main() -> None:
 
     with map_column:
         try:
+            valid_features = [
+                feature
+                for feature in line_features
+                if (feature.get("properties") or {}).get("data_status") != "NO_DATA"
+            ]
+            valid_features = sanitize_features_for_map(valid_features)
+            valid_segment_ids = {
+                (feature.get("properties") or {}).get("segment_id") for feature in valid_features
+            }
+            buffer_features_for_map = [
+                feature
+                for feature in buffer_features
+                if (feature.get("properties") or {}).get("segment_id") in valid_segment_ids
+            ]
+            if not valid_features:
+                st.info("No segments with valid NDVI data to display on map.")
             fmap = create_map(
                 ndvi_overlay=ndvi_overlay,
-                line_features=line_features,
-                buffer_features=buffer_features,
+                line_features=valid_features,
+                buffer_features=buffer_features_for_map,
                 show_buffers=show_buffers,
                 opacity=opacity,
             )
