@@ -28,6 +28,7 @@ from streamlit_folium import st_folium
 
 from infrawatch.scoring import score_traction_segments
 from infrawatch.scoring.traction_risk import sample_ndvi_for_line
+from infrawatch.utils.crs import normalize_crs, to_crs_transformer, transform_bounds_always_xy
 
 
 @dataclass
@@ -45,6 +46,7 @@ LATITUDE_LIMIT_DEG = 90
 DEMO_SEGMENT_HALF_LENGTH_M = 100.0
 DEMO_SEGMENT_HALF_WIDTH_M = 50.0
 DEMO_SEGMENT_MARGIN_FRACTION = 0.1
+DEMO_SEGMENT_MARGIN_M = 75.0
 
 
 def _get_logger() -> logging.Logger:
@@ -131,14 +133,6 @@ def _coordinates_look_projected(coord: Sequence[float] | None) -> bool:
     return abs(coord[0]) > LONGITUDE_LIMIT_DEG or abs(coord[1]) > LATITUDE_LIMIT_DEG
 
 
-def normalize_crs(value):
-    from pyproj import CRS
-
-    if value is None:
-        return None
-    return CRS.from_user_input(value)
-
-
 def detect_geojson_crs(payload: dict[str, Any], ndvi_crs=None):
     from pyproj import CRS
 
@@ -154,41 +148,6 @@ def detect_geojson_crs(payload: dict[str, Any], ndvi_crs=None):
         return normalize_crs(ndvi_crs) or CRS.from_epsg(DEFAULT_UTM_EPSG)
 
     return CRS.from_epsg(4326)
-
-
-def to_crs_transformer(source, target):
-    from pyproj import Transformer
-
-    source = normalize_crs(source)
-    target = normalize_crs(target)
-
-    if source is None or target is None:
-        return None
-    if source == target:
-        return None
-
-    return Transformer.from_crs(source, target, always_xy=True)
-
-
-def transform_bounds_always_xy(
-    source, target, bounds: tuple[float, float, float, float]
-) -> tuple[float, float, float, float]:
-    """Transform bounds using explicit x/y axis order for reliable lon/lat results."""
-    from pyproj import Transformer
-
-    source = normalize_crs(source)
-    target = normalize_crs(target)
-
-    if source is None or target is None:
-        raise ValueError("CRS required to transform bounds.")
-    if source == target:
-        return bounds
-
-    left, bottom, right, top = bounds
-    transformer = Transformer.from_crs(source, target, always_xy=True)
-    minx, miny = transformer.transform(left, bottom)
-    maxx, maxy = transformer.transform(right, top)
-    return (min(minx, maxx), min(miny, maxy), max(minx, maxx), max(miny, maxy))
 
 
 def transform_geometry(geom, transformer) -> Any:
@@ -299,6 +258,14 @@ def read_ndvi_metadata(ndvi_path: Path) -> tuple[Any, Any, list[list[float]] | N
     return None, None, None
 
 
+def _safe_demo_margin(span_m: float) -> float:
+    """Return a margin that keeps demo segments fully inside the raster extent."""
+    if span_m <= 0:
+        return 0.0
+    margin = min(span_m * DEMO_SEGMENT_MARGIN_FRACTION, DEMO_SEGMENT_MARGIN_M)
+    return max(0.0, min(margin, (span_m / 2) - 1.0))
+
+
 def generate_demo_segment(ndvi_path: Path, output_path: Path) -> Path | None:
     """Generate a short demo LineString centered in the NDVI bounds."""
     import rasterio
@@ -316,8 +283,10 @@ def generate_demo_segment(ndvi_path: Path, output_path: Path) -> Path | None:
 
         center_x = (bounds.left + bounds.right) / 2
         center_y = (bounds.bottom + bounds.top) / 2
-        margin_x = span_x * DEMO_SEGMENT_MARGIN_FRACTION
-        margin_y = span_y * DEMO_SEGMENT_MARGIN_FRACTION
+        margin_x = _safe_demo_margin(span_x)
+        margin_y = _safe_demo_margin(span_y)
+        if span_x - 2 * margin_x <= 0 or span_y - 2 * margin_y <= 0:
+            raise ValueError("NDVI bounds too small for safe demo margin.")
         half_length = min(DEMO_SEGMENT_HALF_LENGTH_M, (span_x - 2 * margin_x) / 2)
         half_width = min(DEMO_SEGMENT_HALF_WIDTH_M, (span_y - 2 * margin_y) / 2)
         half_length = max(half_length, 1.0)
@@ -782,12 +751,18 @@ def main() -> None:
         st.error(f"Failed to prepare risk table: {exc}")
         results_df = pd.DataFrame()
 
-    if not results_df.empty and (results_df["data_status"] == "NO_DATA").any():
-        st.warning(
-            "NDVI returned NO_DATA for one or more segments. This usually means the segment "
-            "geometry does not overlap the NDVI raster or uses a mismatched CRS."
-        )
-        if show_debug and ndvi_bounds is not None:
+    if not results_df.empty:
+        no_data_mask = results_df["data_status"] == "NO_DATA"
+        if no_data_mask.all():
+            st.warning(
+                "NDVI returned NO_DATA for all segments. This usually means the segment "
+                "geometry does not overlap the NDVI raster or uses a mismatched CRS."
+            )
+        elif no_data_mask.any():
+            st.info(
+                "NDVI returned NO_DATA for one or more segments. Check segment overlap and CRS if needed."
+            )
+        if no_data_mask.any() and show_debug and ndvi_bounds is not None:
             debug_payload: dict[str, Any] = {
                 "ndvi_bounds_native": {
                     "left": ndvi_bounds.left,
