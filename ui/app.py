@@ -397,7 +397,11 @@ def main() -> None:
     st.title("InfraWatch — Traction Vegetation Risk")
 
     base_dir = Path("satellite_data/raw/s2")
-    ndvi_detection = detect_latest_ndvi(base_dir)
+    ndvi_detection = NdviDetection(path=None, scene_date=None, scene_folder=None)
+    try:
+        ndvi_detection = detect_latest_ndvi(base_dir)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Failed to detect latest NDVI: {exc}")
 
     ndvi_default = str(ndvi_detection.path) if ndvi_detection.path else ""
     lines_default = str(Path("tests/data/demo_lines.geojson"))
@@ -437,16 +441,20 @@ def main() -> None:
             st.error(f"Failed to load NDVI: {exc}")
 
     if lines_path.exists():
-        lines_payload = load_geojson(lines_path)
-        lines_payload["_path"] = str(lines_path)
+        try:
+            lines_payload = load_geojson(lines_path)
+            lines_payload["_path"] = str(lines_path)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Failed to load traction lines: {exc}")
+            lines_payload = {}
     else:
         st.error("Traction lines GeoJSON not found.")
 
     results: list[dict[str, Any]] = []
     if lines_payload and (run_scoring or not (risk_path and risk_path.exists())):
         if ndvi_path.exists():
-            source_crs = detect_geojson_crs(lines_payload)
             try:
+                source_crs = detect_geojson_crs(lines_payload)
                 scoring_path = prepare_lines_for_scoring(lines_payload, source_crs, ndvi_crs or source_crs)
                 results = score_traction_segments(ndvi_path, scoring_path, buffer_m=buffer_m)
                 st.info("Scoring computed from NDVI and traction lines.")
@@ -461,27 +469,38 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001
             st.error(f"Failed to load risk JSON: {exc}")
 
-    results_df = build_results_table(results)
+    try:
+        results_df = build_results_table(results)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Failed to prepare risk table: {exc}")
+        results_df = pd.DataFrame()
 
     if lines_payload:
-        source_crs = detect_geojson_crs(lines_payload)
-        line_features, buffer_features = build_map_features(
-            lines_payload, results_df, source_crs, ndvi_crs, buffer_m
-        )
+        try:
+            source_crs = detect_geojson_crs(lines_payload)
+            line_features, buffer_features = build_map_features(
+                lines_payload, results_df, source_crs, ndvi_crs, buffer_m
+            )
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Failed to prepare map features: {exc}")
+            line_features, buffer_features = [], []
     else:
         line_features, buffer_features = [], []
 
     map_column, table_column = st.columns([3, 2])
 
     with map_column:
-        fmap = create_map(
-            ndvi_overlay=ndvi_overlay,
-            line_features=line_features,
-            buffer_features=buffer_features,
-            show_buffers=show_buffers,
-            opacity=opacity,
-        )
-        st_folium(fmap, width=800, height=600)
+        try:
+            fmap = create_map(
+                ndvi_overlay=ndvi_overlay,
+                line_features=line_features,
+                buffer_features=buffer_features,
+                show_buffers=show_buffers,
+                opacity=opacity,
+            )
+            st_folium(fmap, width=800, height=600)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Failed to render map: {exc}")
 
     with table_column:
         st.subheader("Risk Summary")
