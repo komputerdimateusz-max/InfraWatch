@@ -42,6 +42,9 @@ LOG_PATH = Path("ui_runtime.log")
 DEFAULT_UTM_EPSG = 32633
 LONGITUDE_LIMIT_DEG = 180
 LATITUDE_LIMIT_DEG = 90
+DEMO_SEGMENT_HALF_LENGTH_M = 100.0
+DEMO_SEGMENT_HALF_WIDTH_M = 50.0
+DEMO_SEGMENT_MARGIN_FRACTION = 0.1
 
 
 def _get_logger() -> logging.Logger:
@@ -299,7 +302,6 @@ def read_ndvi_metadata(ndvi_path: Path) -> tuple[Any, Any, list[list[float]] | N
 def generate_demo_segment(ndvi_path: Path, output_path: Path) -> Path | None:
     """Generate a short demo LineString centered in the NDVI bounds."""
     import rasterio
-    from pyproj import CRS
 
     try:
         with rasterio.open(ndvi_path) as dataset:
@@ -307,28 +309,48 @@ def generate_demo_segment(ndvi_path: Path, output_path: Path) -> Path | None:
             ndvi_crs = dataset.crs
         if ndvi_crs is None:
             raise ValueError("NDVI CRS unavailable; cannot generate demo segment.")
-        wgs_bounds = transform_bounds_always_xy(ndvi_crs, CRS.from_epsg(4326), bounds)
-        min_lon, min_lat, max_lon, max_lat = wgs_bounds
-        mid_lat = (min_lat + max_lat) / 2
-        span_lon = max_lon - min_lon
-        if span_lon <= 0:
+        span_x = bounds.right - bounds.left
+        span_y = bounds.top - bounds.bottom
+        if span_x <= 0 or span_y <= 0:
             raise ValueError("NDVI bounds invalid for demo segment.")
-        padding = span_lon * 0.2
-        lon_start = min_lon + padding
-        lon_end = max_lon - padding
-        coords = [
-            [lon_start, mid_lat],
-            [lon_end, mid_lat],
+
+        center_x = (bounds.left + bounds.right) / 2
+        center_y = (bounds.bottom + bounds.top) / 2
+        margin_x = span_x * DEMO_SEGMENT_MARGIN_FRACTION
+        margin_y = span_y * DEMO_SEGMENT_MARGIN_FRACTION
+        half_length = min(DEMO_SEGMENT_HALF_LENGTH_M, (span_x - 2 * margin_x) / 2)
+        half_width = min(DEMO_SEGMENT_HALF_WIDTH_M, (span_y - 2 * margin_y) / 2)
+        half_length = max(half_length, 1.0)
+        half_width = max(half_width, 1.0)
+        second_offset = min(half_width * 1.5, (span_y / 2) - margin_y)
+        second_offset = max(second_offset, half_width)
+
+        first_line = [
+            [center_x - half_length, center_y - half_width],
+            [center_x + half_length, center_y + half_width],
+        ]
+        second_line = [
+            [center_x - half_length, center_y + half_width],
+            [center_x + half_length, center_y + second_offset],
         ]
         payload = {
             "type": "FeatureCollection",
+            "crs": {"type": "name", "properties": {"name": ndvi_crs.to_string()}},
             "features": [
                 {
                     "type": "Feature",
                     "properties": {"segment_id": 1},
                     "geometry": {
                         "type": "LineString",
-                        "coordinates": coords,
+                        "coordinates": first_line,
+                    },
+                },
+                {
+                    "type": "Feature",
+                    "properties": {"segment_id": 2},
+                    "geometry": {
+                        "type": "LineString",
+                        "coordinates": second_line,
                     },
                 }
             ],
