@@ -9,6 +9,7 @@ Quick run:
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -370,6 +371,18 @@ def bounds_from_features(features: list[dict[str, Any]]) -> list[list[float]] | 
     return [[min(lons), min(lats)], [max(lons), max(lats)]]
 
 
+def get_default_view_from_ndvi_bounds(
+    ndvi_bounds_wgs84: list[list[float]] | None,
+    line_features: list[dict[str, Any]],
+) -> dict[str, float] | None:
+    bounds = ndvi_bounds_wgs84 or bounds_from_features(line_features)
+    if not bounds:
+        return None
+    west, south = bounds[0]
+    east, north = bounds[1]
+    return {"lat": (south + north) / 2, "lng": (west + east) / 2}
+
+
 def bounds_from_feature_collection(payload: dict[str, Any]) -> tuple[float, float, float, float] | None:
     from shapely.geometry import shape
 
@@ -597,6 +610,46 @@ def _build_line_feature_collection(features: list[dict[str, Any]]) -> dict[str, 
     return {"type": "FeatureCollection", "features": features}
 
 
+def _geometry_key(geometry: dict[str, Any]) -> str:
+    normalized = normalize_geojson_coordinates(geometry)
+    payload = json.dumps(normalized, sort_keys=True)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def dedup_features(features: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for feature in features:
+        geometry = feature.get("geometry") or {}
+        if geometry.get("type") not in _line_geometry_types():
+            continue
+        key = _geometry_key(geometry)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized = dict(feature)
+        normalized["geometry"] = normalize_geojson_coordinates(geometry)
+        properties = dict(feature.get("properties") or {})
+        properties.setdefault("feature_id", f"drawn-{key}")
+        normalized["properties"] = properties
+        unique.append(normalized)
+    return unique
+
+
+def _assign_segment_ids(features: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    assigned: list[dict[str, Any]] = []
+    for idx, feature in enumerate(features, start=1):
+        properties = dict(feature.get("properties") or {})
+        properties["segment_id"] = idx
+        assigned.append(
+            {
+                "type": "Feature",
+                "geometry": feature.get("geometry"),
+                "properties": properties,
+            }
+        )
+    return assigned
+
 def _build_line_feature(
     geometry: dict[str, Any],
     segment_id: int,
@@ -629,23 +682,22 @@ def _coerce_features_from_drawing(drawing: dict[str, Any]) -> list[dict[str, Any
 
 
 def normalize_drawings_to_featurecollection(map_output: dict[str, Any] | None) -> dict[str, Any]:
-    drawings = _extract_drawings(map_output)
+    drawings = extract_drawings(map_output)
     features: list[dict[str, Any]] = []
-    segment_id = 1
     for drawing in drawings:
         for feature in _coerce_features_from_drawing(drawing):
             geometry = feature.get("geometry") or {}
             if geometry.get("type") not in _line_geometry_types():
                 continue
             features.append(
-                _build_line_feature(
-                    normalize_geojson_coordinates(geometry),
-                    segment_id,
-                    f"drawn-{segment_id}",
-                )
+                {
+                    "type": "Feature",
+                    "geometry": normalize_geojson_coordinates(geometry),
+                    "properties": dict(feature.get("properties") or {}),
+                }
             )
-            segment_id += 1
-    return _build_line_feature_collection(features)
+    deduped = dedup_features(features)
+    return _build_line_feature_collection(_assign_segment_ids(deduped))
 
 
 def merge_lines(
@@ -653,21 +705,8 @@ def merge_lines(
 ) -> dict[str, Any]:
     existing_features = list((existing_fc or {}).get("features", []))
     new_features = list((new_fc or {}).get("features", []))
-    merged: list[dict[str, Any]] = []
-    segment_id = 1
-    for feature in existing_features + new_features:
-        geometry = feature.get("geometry") or {}
-        if geometry.get("type") not in _line_geometry_types():
-            continue
-        merged.append(
-            _build_line_feature(
-                normalize_geojson_coordinates(geometry),
-                segment_id,
-                feature.get("properties", {}).get("feature_id", f"drawn-{segment_id}"),
-            )
-        )
-        segment_id += 1
-    return _build_line_feature_collection(merged)
+    merged = dedup_features(existing_features + new_features)
+    return _build_line_feature_collection(_assign_segment_ids(merged))
 
 
 def transform_featurecollection(payload: dict[str, Any], source_crs, target_crs) -> dict[str, Any]:
@@ -691,7 +730,7 @@ def transform_featurecollection(payload: dict[str, Any], source_crs, target_crs)
     return {"type": "FeatureCollection", "features": transformed_features}
 
 
-def _extract_drawings(map_output: dict[str, Any] | None) -> list[dict[str, Any]]:
+def extract_drawings(map_output: dict[str, Any] | None) -> list[dict[str, Any]]:
     if not map_output:
         return []
     drawings = map_output.get("all_drawings")
@@ -875,8 +914,14 @@ def main() -> None:
 
     if "lines_path" not in st.session_state:
         st.session_state["lines_path"] = lines_default
-    if "drawn_lines_fc_wgs84" not in st.session_state:
-        st.session_state["drawn_lines_fc_wgs84"] = {}
+    if "drawn_features" not in st.session_state:
+        st.session_state["drawn_features"] = {}
+    if "map_center" not in st.session_state:
+        st.session_state["map_center"] = None
+    if "map_zoom" not in st.session_state:
+        st.session_state["map_zoom"] = None
+    if "drawn_lines_fc_wgs84" in st.session_state and not st.session_state["drawn_features"]:
+        st.session_state["drawn_features"] = st.session_state["drawn_lines_fc_wgs84"]
 
     with st.sidebar:
         st.header("Inputs")
@@ -906,7 +951,7 @@ def main() -> None:
         )
         if traction_mode == "Draw on map":
             if st.button("Clear drawn lines"):
-                st.session_state["drawn_lines_fc_wgs84"] = {}
+                st.session_state["drawn_features"] = {}
                 st.session_state.pop("drawn_lines_path", None)
         lines_path_input = st.text_input("Traction lines GeoJSON path", key="lines_path")
         coordinate_format = None
@@ -969,7 +1014,7 @@ def main() -> None:
             st.error("Traction lines GeoJSON not found.")
     elif traction_mode == "Draw on map":
         # Read previously drawn segments captured from the folium draw tool.
-        drawings = st.session_state.get("drawn_lines_fc_wgs84", {})
+        drawings = st.session_state.get("drawn_features", {})
         if drawings:
             lines_payload = dict(drawings)
             lines_payload["_path"] = st.session_state.get("drawn_lines_path", "")
@@ -1041,12 +1086,15 @@ def main() -> None:
         if ndvi_bounds_wgs84 is not None:
             debug_payload["ndvi_bounds_wgs84"] = ndvi_bounds_wgs84
         if traction_mode == "Draw on map":
-            stored = st.session_state.get("drawn_lines_fc_wgs84", {})
+            stored = st.session_state.get("drawn_features", {})
             stored_features = stored.get("features", [])
             debug_payload["stored_drawn_count"] = len(stored_features)
             debug_payload["stored_drawn_types"] = [
                 (feature.get("geometry") or {}).get("type") for feature in stored_features
             ]
+            debug_payload["session_map_center"] = st.session_state.get("map_center")
+            debug_payload["session_map_zoom"] = st.session_state.get("map_zoom")
+            debug_payload["last_map_output_keys"] = st.session_state.get("last_map_output_keys", [])
         if lines_payload:
             source_crs = lines_crs or detect_geojson_crs(lines_payload, ndvi_crs)
             debug_payload["lines_source_crs"] = source_crs.to_string() if source_crs else "unknown"
@@ -1129,6 +1177,10 @@ def main() -> None:
             buffer_features_for_map = sanitize_features_for_map(valid_buffer_features)
             if not map_features:
                 st.info("No segments available to display on map.")
+            default_center = get_default_view_from_ndvi_bounds(
+                ndvi_bounds_wgs84, map_features
+            )
+            map_center = st.session_state.get("map_center") or default_center
             fmap = create_map(
                 ndvi_overlay=ndvi_overlay,
                 line_features=map_features,
@@ -1137,11 +1189,12 @@ def main() -> None:
                 opacity=opacity,
                 fit_bounds=fit_bounds,
                 enable_drawing=traction_mode == "Draw on map",
-                map_center=st.session_state.get("map_center"),
+                map_center=map_center,
                 map_zoom=st.session_state.get("map_zoom"),
             )
             map_output = st_folium(fmap, width=800, height=600, key="traction_map")
             if map_output:
+                st.session_state["last_map_output_keys"] = sorted(map_output.keys())
                 center = map_output.get("center")
                 zoom = map_output.get("zoom")
                 if isinstance(center, dict) and "lat" in center and "lng" in center:
@@ -1156,15 +1209,15 @@ def main() -> None:
                         updated_payload = new_payload
                     else:
                         updated_payload = merge_lines(
-                            st.session_state.get("drawn_lines_fc_wgs84"), new_payload
+                            st.session_state.get("drawn_features"), new_payload
                         )
                     if updated_payload.get("features"):
-                        st.session_state["drawn_lines_fc_wgs84"] = updated_payload
+                        st.session_state["drawn_features"] = updated_payload
                         st.session_state["drawn_lines_path"] = str(
                             _write_temp_geojson(updated_payload)
                         )
                     elif "all_drawings" in map_output:
-                        st.session_state["drawn_lines_fc_wgs84"] = {}
+                        st.session_state["drawn_features"] = {}
                         st.session_state.pop("drawn_lines_path", None)
         except Exception as exc:  # noqa: BLE001
             st.error(f"Failed to render map: {exc}")
