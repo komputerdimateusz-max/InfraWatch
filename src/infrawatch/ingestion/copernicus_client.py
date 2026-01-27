@@ -18,6 +18,7 @@ from .paths import as_bbox_list, select_asset_filename
 STAC_ENDPOINT = "https://stac.dataspace.copernicus.eu/v1/search"
 COLLECTION_ID = "sentinel-2-l2a"
 DOWNLOAD_TIMEOUT = 120
+DOWNLOAD_RETRIES = 3
 
 # CDSE Auth + OData (for downloading files via Nodes())
 IDENTITY_TOKEN_URL = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
@@ -88,30 +89,75 @@ class CopernicusClient:
         self._access_token = token
         return token
 
-    def _odata_product_uuid_for_name(self, product_safe_name: str) -> str:
+    def _odata_product_uuid_for_name(self, product_safe_name: str, product_identifier: str | None = None) -> str:
         token = self._get_access_token()
-        filter_expr = f"Name eq '{product_safe_name}'"
-        qs = urlencode({"$filter": filter_expr})
-        url = f"{ODATA_BASE}/Products?{qs}"
+        filters = [f"Name eq '{product_safe_name}'"]
+        if product_identifier:
+            filters.append(f"ProductIdentifier eq '{product_identifier}'")
 
-        req = Request(url, headers={"Authorization": f"Bearer {token}"})
-        try:
-            with urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-        except HTTPError as exc:
-            raise RuntimeError(http_error_message(exc, url)) from exc
-        except URLError as exc:
-            raise RuntimeError(f"Network error while contacting {url}: {exc}") from exc
+        for filter_expr in filters:
+            qs = urlencode({"$filter": filter_expr}, quote_via=quote)
+            url = f"{ODATA_BASE}/Products?{qs}"
 
-        items = payload.get("value", [])
-        if not items:
-            raise RuntimeError(f"OData: product not found for Name='{product_safe_name}'.")
-        product_id = items[0].get("Id")
-        if not product_id:
-            raise RuntimeError("OData: product record is missing Id.")
-        return str(product_id)
+            req = Request(url, headers={"Authorization": f"Bearer {token}"})
+            try:
+                with urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+            except HTTPError as exc:
+                raise RuntimeError(http_error_message(exc, url)) from exc
+            except URLError as exc:
+                raise RuntimeError(f"Network error while contacting {url}: {exc}") from exc
 
-    def _download_via_odata_nodes(self, s3_href: str, destination_dir: Path) -> Path:
+            items = payload.get("value", [])
+            if items:
+                product_id = items[0].get("Id")
+                if not product_id:
+                    raise RuntimeError("OData: product record is missing Id.")
+                return str(product_id)
+
+        raise RuntimeError(
+            "OData: product not found for Name or ProductIdentifier. "
+            f"Name='{product_safe_name}' Identifier='{product_identifier}'."
+        )
+
+    def _stream_download(self, url: str, headers: dict[str, str], output_path: Path, retries: int) -> Path:
+        last_error: Exception | None = None
+        for attempt in range(1, retries + 1):
+            logger.info("Downloading %s (attempt %s/%s)", url, attempt, retries)
+            try:
+                req = Request(url, headers=headers)
+                with urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp:
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    bytes_written = 0
+                    with output_path.open("wb") as handle:
+                        while True:
+                            chunk = resp.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            handle.write(chunk)
+                            bytes_written += len(chunk)
+                logger.info("Downloaded %s bytes -> %s", bytes_written, output_path)
+                return output_path
+            except HTTPError as exc:
+                last_error = exc
+                if exc.code < 500 or attempt == retries:
+                    raise RuntimeError(http_error_message(exc, url)) from exc
+            except URLError as exc:
+                last_error = exc
+                if attempt == retries:
+                    raise RuntimeError(f"Network error while downloading {url}: {exc}") from exc
+            if output_path.exists():
+                output_path.unlink()
+            logger.warning("Retrying download after error: %s", last_error)
+        raise RuntimeError(f"Failed to download {url} after {retries} attempts.")
+
+    def _download_via_odata_nodes(
+        self,
+        s3_href: str,
+        destination_dir: Path,
+        product_identifier: str | None = None,
+        retries: int = DOWNLOAD_RETRIES,
+    ) -> Path:
         """
         Download a single file from a product given an s3://eodata/... href via OData Nodes().
         """
@@ -134,7 +180,7 @@ class CopernicusClient:
         if not inside_parts:
             raise RuntimeError(f"No file path inside product for: {s3_href}")
 
-        product_uuid = self._odata_product_uuid_for_name(product_safe_name)
+        product_uuid = self._odata_product_uuid_for_name(product_safe_name, product_identifier=product_identifier)
 
         def node(seg: str) -> str:
             return f"Nodes({quote(seg, safe='-_.()')})"
@@ -150,20 +196,31 @@ class CopernicusClient:
 
         logger.info("Downloading via OData Nodes -> %s", output_path)
 
-        try:
-            req = Request(url, headers=headers)
-            with urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp:
-                with output_path.open("wb") as handle:
-                    while True:
-                        chunk = resp.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        handle.write(chunk)
-            return output_path
-        except HTTPError as exc:
-            raise RuntimeError(http_error_message(exc, url)) from exc
-        except URLError as exc:
-            raise RuntimeError(f"Network error while downloading {url}: {exc}") from exc
+        return self._stream_download(url, headers, output_path, retries=retries)
+
+    def download_asset(
+        self,
+        asset_name: str,
+        href: str,
+        destination_dir: Path,
+        product_identifier: str | None = None,
+        retries: int = DOWNLOAD_RETRIES,
+    ) -> Path:
+        filename_fallback = f"{asset_name}.bin"
+        if href.startswith("s3://eodata/"):
+            return self._download_via_odata_nodes(
+                href,
+                destination_dir,
+                product_identifier=product_identifier,
+                retries=retries,
+            )
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        fname = select_asset_filename(href, filename_fallback)
+        output_path = destination_dir / fname
+        headers: dict[str, str] = {}
+        if self.auth:
+            headers["Authorization"] = self.auth.basic_header()
+        return self._stream_download(href, headers, output_path, retries=retries)
 
     def download_scene(self, scene: SceneSummary, destination_dir: Path) -> dict[str, Path]:
         """
@@ -175,30 +232,13 @@ class CopernicusClient:
             # Choose filename by href; if it lacks extension, fallback to band
             filename_fallback = f"{scene.product_id}_{band}.bin"
             _ = select_asset_filename(href, filename_fallback)  # keep behavior consistent even if not used
-            path = self._download_via_odata_nodes(href, destination_dir) if href.startswith("s3://eodata/") else None
-            if path is None:
-                # Fallback HTTPS download (rare); keep minimal
-                destination_dir.mkdir(parents=True, exist_ok=True)
-                fname = select_asset_filename(href, filename_fallback)
-                output_path = destination_dir / fname
-                headers: dict[str, str] = {}
-                if self.auth:
-                    headers["Authorization"] = self.auth.basic_header()
-                req = Request(href, headers=headers)
-                try:
-                    with urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp:
-                        with output_path.open("wb") as handle:
-                            while True:
-                                chunk = resp.read(1024 * 1024)
-                                if not chunk:
-                                    break
-                                handle.write(chunk)
-                except HTTPError as exc:
-                    raise RuntimeError(http_error_message(exc, href)) from exc
-                except URLError as exc:
-                    raise RuntimeError(f"Network error while downloading {href}: {exc}") from exc
-                path = output_path
-
+            path = self.download_asset(
+                band,
+                href,
+                destination_dir,
+                product_identifier=scene.product_id,
+                retries=DOWNLOAD_RETRIES,
+            )
             downloaded[band] = path
         return downloaded
 
