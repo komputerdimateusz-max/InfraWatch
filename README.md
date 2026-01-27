@@ -55,6 +55,47 @@ All data is provided by the **Copernicus Programme** and can be used for **comme
 
 ---
 
+## ⬇️ Downloading NDVI data
+
+The Streamlit UI now includes a **NDVI Downloader** sidebar section for pulling additional
+Sentinel-2 scenes and generating `ndvi.tif` files automatically.
+
+### Workflow
+1. **Draw a line** on the map (or enter a manual bbox) so the downloader knows the AOI.
+2. In the sidebar, open **NDVI Downloader** and choose:
+   - AOI source (drawn buffer bbox or manual bbox)
+   - date range
+   - maximum cloud cover
+   - backend (CDSE or AWS Open Data)
+3. Click **Search**, then **Download** on a scene to fetch data and compute NDVI.
+4. The app stores outputs in:
+   ```
+   C:\\InfraWatch\\satellite_data\\raw\\s2\\YYYYMMDD\\<scene_folder>\\ndvi.tif
+   ```
+   and immediately rescans available NDVI dates.
+
+### Credentials (optional)
+CDSE downloads require credentials. Copy `.env.example` to `.env` and set:
+```
+COPERNICUS_USERNAME=your_username
+COPERNICUS_PASSWORD=your_password
+```
+If CDSE fails, switch to **AWS Open Data (Earth Search)** which does not require credentials.
+
+### Windows setup (PowerShell)
+```
+Copy-Item .env.example .env
+notepad .env
+```
+
+### Windows setup (cmd)
+```
+copy .env.example .env
+notepad .env
+```
+
+---
+
 ## 📊 Key Analytics & Metrics
 
 ### Vegetation Analytics
@@ -198,7 +239,6 @@ Project status: **Early development / MVP**
 
 ## 📬 Contact
 Repository owner: InfraWatch  
-
 
 
 
