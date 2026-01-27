@@ -17,7 +17,6 @@ dependencies = [
   "folium>=0.15",
   "numpy>=1.26",
   "pandas>=2.2",
-  "pystac-client>=0.7",
   "python-dotenv>=1.0",
   "pydantic>=2.7",
   "pyproj>=3.6",
@@ -30,6 +29,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+downloader = [
+  "pystac-client>=0.7",
+]
 dev = [
   "pytest>=8.2",
   "ruff>=0.5",

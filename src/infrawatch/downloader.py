@@ -11,7 +11,11 @@ from typing import Iterable
 import numpy as np
 import requests
 import rasterio
-from pystac_client import Client
+
+try:
+    from pystac_client import Client
+except ImportError:  # pragma: no cover - optional dependency
+    Client = None
 
 CDSE_STAC_URL = "https://catalogue.dataspace.copernicus.eu/stac"
 EARTH_SEARCH_URL = "https://earth-search.aws.element84.com/v1"
@@ -91,6 +95,7 @@ def _resolve_asset(assets: dict[str, str], keys: Iterable[str]) -> str | None:
 
 
 def _search_cdse(params: SearchParams) -> list[Scene]:
+    _require_pystac_client()
     client = Client.open(CDSE_STAC_URL)
     time_range = f"{params.date_range[0].isoformat()}/{params.date_range[1].isoformat()}"
     search = client.search(
@@ -105,6 +110,7 @@ def _search_cdse(params: SearchParams) -> list[Scene]:
 
 
 def _search_earth_search(params: SearchParams) -> list[Scene]:
+    _require_pystac_client()
     client = Client.open(EARTH_SEARCH_URL)
     time_range = f"{params.date_range[0].isoformat()}/{params.date_range[1].isoformat()}"
     search = client.search(
@@ -223,3 +229,11 @@ def _compute_ndvi(red_path: Path, nir_path: Path, ndvi_path: Path) -> None:
         ndvi_path.parent.mkdir(parents=True, exist_ok=True)
         with rasterio.open(ndvi_path, "w", **profile) as dst:
             dst.write(ndvi_out, 1)
+
+
+def _require_pystac_client() -> None:
+    if Client is None:
+        raise RuntimeError(
+            "pystac-client is required for the NDVI downloader. "
+            "Install it with `pip install pystac-client`."
+        )
