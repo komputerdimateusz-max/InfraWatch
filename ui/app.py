@@ -41,6 +41,7 @@ class NdviDetection:
 
 
 DATE_PATTERN = re.compile(r"(20\d{6})")
+DATE_FOLDER_PATTERN = re.compile(r"^\d{8}$")
 LOG_PATH = Path("ui_runtime.log")
 DEFAULT_UTM_EPSG = 32633
 LONGITUDE_LIMIT_DEG = 180
@@ -52,6 +53,164 @@ DEMO_SEGMENT_MARGIN_M = 75.0
 MAP_COMPONENT_KEY = "main_map"
 MAP_CENTER_EPSILON = 1e-6
 MAP_ZOOM_EPSILON = 0.01
+DEFAULT_NDVI_BASE_DIR = Path(r"C:\InfraWatch\satellite_data\raw\s2")
+
+
+@dataclass
+class NdviCandidate:
+    path: Path
+    size: int
+    mtime: float
+    reason: str
+    msil2a: bool
+    has_ndvi: bool
+    ndvi_prefix: bool
+
+
+@dataclass
+class NdviScanMeta:
+    selected_path: str | None
+    candidates_count: int
+    reason: str | None
+    file_size: int | None
+    mtime: float | None
+    candidates: list[str]
+    warning: str | None
+
+
+def _format_date_label(date_str: str) -> str:
+    try:
+        return datetime.strptime(date_str, "%Y%m%d").strftime("%Y-%m-%d")
+    except ValueError:
+        return date_str
+
+
+def _rank_candidate(candidate: NdviCandidate) -> tuple[int, int, int, int, float]:
+    return (
+        1 if candidate.msil2a else 0,
+        1 if candidate.has_ndvi else 0,
+        1 if candidate.ndvi_prefix else 0,
+        candidate.size,
+        candidate.mtime,
+    )
+
+
+def _candidate_from_path(path: Path, reason: str) -> NdviCandidate:
+    stat = path.stat()
+    name_lower = path.name.lower()
+    path_lower = str(path).lower()
+    return NdviCandidate(
+        path=path,
+        size=stat.st_size,
+        mtime=stat.st_mtime,
+        reason=reason,
+        msil2a="msil2a" in path_lower,
+        has_ndvi="ndvi" in name_lower,
+        ndvi_prefix=path.name.upper().startswith("NDVI_"),
+    )
+
+
+def _find_ndvi_candidates(date_dir: Path) -> list[NdviCandidate]:
+    tif_paths = [
+        path
+        for path in date_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".tif", ".tiff"}
+    ]
+    primary = [path for path in tif_paths if path.name.lower() == "ndvi.tif"]
+    if primary:
+        return [_candidate_from_path(path, "primary_exact") for path in primary]
+
+    named_ndvi = [path for path in tif_paths if "ndvi" in path.name.lower()]
+    if named_ndvi:
+        return [_candidate_from_path(path, "fallback_ndvi_name") for path in named_ndvi]
+
+    if tif_paths:
+        return [_candidate_from_path(path, "fallback_any_tif") for path in tif_paths]
+    return []
+
+
+def _select_ndvi_candidate(candidates: list[NdviCandidate]) -> tuple[NdviCandidate | None, str | None]:
+    if not candidates:
+        return None, None
+
+    sorted_candidates = sorted(
+        candidates,
+        key=_rank_candidate,
+        reverse=True,
+    )
+    valid_candidates: list[NdviCandidate] = []
+    import rasterio
+
+    for candidate in sorted_candidates:
+        try:
+            with rasterio.open(candidate.path):
+                valid_candidates.append(candidate)
+        except Exception:  # noqa: BLE001
+            continue
+
+    if not valid_candidates:
+        return None, None
+
+    valid_candidates.sort(key=_rank_candidate, reverse=True)
+    selected = valid_candidates[0]
+    top_rank = _rank_candidate(selected)
+    ambiguous = [cand for cand in valid_candidates if _rank_candidate(cand) == top_rank]
+    warning = None
+    if len(ambiguous) > 1:
+        warning = (
+            "Multiple NDVI candidates matched equally; selected best match. "
+            f"Candidates: {', '.join(str(c.path) for c in valid_candidates)}"
+        )
+    return selected, warning
+
+
+@st.cache_data(show_spinner=False)
+def scan_ndvi_inventory(
+    base_dir: str,
+) -> tuple[dict[str, str], list[str], dict[str, NdviScanMeta], list[str]]:
+    base_path = Path(base_dir).expanduser()
+    if not base_path.exists():
+        return {}, [], {}, [f"Base directory not found: {base_path}"]
+
+    date_dirs = [
+        path
+        for path in base_path.iterdir()
+        if path.is_dir() and DATE_FOLDER_PATTERN.match(path.name)
+    ]
+    inventory: dict[str, str] = {}
+    meta: dict[str, NdviScanMeta] = {}
+    warnings: list[str] = []
+
+    for date_dir in sorted(date_dirs, key=lambda p: p.name, reverse=True):
+        candidates = _find_ndvi_candidates(date_dir)
+        selected, warning = _select_ndvi_candidate(candidates)
+        if warning:
+            warnings.append(f"{date_dir.name}: {warning}")
+        if not selected:
+            meta[date_dir.name] = NdviScanMeta(
+                selected_path=None,
+                candidates_count=len(candidates),
+                reason=None,
+                file_size=None,
+                mtime=None,
+                candidates=[str(c.path) for c in candidates],
+                warning=warning,
+            )
+            continue
+
+        inventory[date_dir.name] = str(selected.path)
+        meta[date_dir.name] = NdviScanMeta(
+            selected_path=str(selected.path),
+            candidates_count=len(candidates),
+            reason=selected.reason,
+            file_size=selected.size,
+            mtime=selected.mtime,
+            candidates=[str(c.path) for c in candidates],
+            warning=warning,
+        )
+
+    dates_sorted = sorted(inventory.keys(), reverse=True)
+    return inventory, dates_sorted, meta, warnings
 
 
 def _get_logger() -> logging.Logger:
@@ -459,6 +618,35 @@ def build_results_table(results: list[dict[str, Any]]) -> pd.DataFrame:
         ascending=[True, True, False],
     )
     return df
+
+
+def build_trend_table(trend_rows: list[dict[str, Any]]) -> pd.DataFrame:
+    trend_df = pd.DataFrame(trend_rows)
+    if trend_df.empty:
+        return trend_df
+    trend_df = trend_df.sort_values(by=["segment_id", "date"], ascending=[True, False])
+    return trend_df
+
+
+def build_delta_table(trend_df: pd.DataFrame, t0: str, t1: str) -> pd.DataFrame:
+    if trend_df.empty:
+        return trend_df
+    df_t0 = trend_df[trend_df["date"] == t0].copy()
+    df_t1 = trend_df[trend_df["date"] == t1].copy()
+    if df_t0.empty or df_t1.empty:
+        return pd.DataFrame()
+    merged = df_t0.merge(
+        df_t1,
+        on="segment_id",
+        suffixes=("_t0", "_t1"),
+    )
+    merged["delta_mean_ndvi"] = merged["mean_ndvi_t1"] - merged["mean_ndvi_t0"]
+    merged["delta_p90_ndvi"] = merged["p90_ndvi_t1"] - merged["p90_ndvi_t0"]
+    merged["delta_pct_above_0_6"] = (
+        merged["pct_above_0_6_t1"] - merged["pct_above_0_6_t0"]
+    )
+    merged["delta_risk_score"] = merged["risk_score_t1"] - merged["risk_score_t0"]
+    return merged
 
 
 def build_map_features(
@@ -968,7 +1156,9 @@ def main() -> None:
     logger = _get_logger()
     logger.info("ui_start")
 
-    base_dir = Path("satellite_data/raw/s2")
+    base_dir = DEFAULT_NDVI_BASE_DIR
+    if not base_dir.exists():
+        base_dir = Path("satellite_data/raw/s2")
     ndvi_detection = NdviDetection(path=None, scene_date=None, scene_folder=None)
     try:
         ndvi_detection = detect_latest_ndvi(base_dir)
@@ -979,6 +1169,10 @@ def main() -> None:
     lines_default = str(Path("tests/data/demo_lines.geojson"))
     risk_default = "traction_risk.json" if Path("traction_risk.json").exists() else ""
     demo_segment_path = Path("satellite_data/demo_segment.geojson")
+    if "ndvi_base_dir" not in st.session_state:
+        st.session_state["ndvi_base_dir"] = str(DEFAULT_NDVI_BASE_DIR)
+    if "uploaded_ndvi_path" not in st.session_state:
+        st.session_state["uploaded_ndvi_path"] = ""
 
     if "lines_path" not in st.session_state:
         st.session_state["lines_path"] = lines_default
@@ -993,11 +1187,103 @@ def main() -> None:
     if "drawn_lines_fc_wgs84" in st.session_state and not st.session_state["drawn_features"].get("features"):
         st.session_state["drawn_features"] = st.session_state["drawn_lines_fc_wgs84"]
 
+    ndvi_stack: list[dict[str, str]] = []
+    ndvi_date_meta: dict[str, NdviScanMeta] = {}
+    ndvi_dates_selected: list[str] = []
+    ndvi_map_date = None
+    t0_date = None
+    t1_date = None
+    use_all_dates = True
+
     with st.sidebar:
         st.header("Inputs")
-        ndvi_path_input = st.text_input("NDVI GeoTIFF path", value=ndvi_default)
+        ndvi_by_date = st.checkbox("Select NDVI by date (recommended)", value=True)
+        selected_base_dir = st.session_state.get("ndvi_base_dir", str(DEFAULT_NDVI_BASE_DIR))
+        if ndvi_by_date:
+            selected_base_dir = st.text_input("NDVI base folder", value=selected_base_dir)
+            st.session_state["ndvi_base_dir"] = selected_base_dir
+            if st.button("Rescan NDVI dates"):
+                st.cache_data.clear()
+            inventory, dates_sorted, meta, scan_warnings = scan_ndvi_inventory(selected_base_dir)
+            ndvi_date_meta = meta
+            for warning in scan_warnings:
+                st.warning(warning)
+            if not dates_sorted:
+                st.error(
+                    "No valid NDVI dates found. Expected folders like YYYYMMDD under the base directory, "
+                    "with NDVI GeoTIFFs inside."
+                )
+            if dates_sorted:
+                default_selection = dates_sorted[:2] if len(dates_sorted) >= 2 else dates_sorted
+                ndvi_dates_selected = st.multiselect(
+                    "NDVI dates",
+                    options=dates_sorted,
+                    default=default_selection,
+                    format_func=_format_date_label,
+                )
+                if ndvi_dates_selected:
+                    selected_sorted = sorted(ndvi_dates_selected)
+                    if len(selected_sorted) >= 2:
+                        t0_index = 0
+                        t1_index = len(selected_sorted) - 1
+                        t0_date = st.selectbox(
+                            "Baseline (t0)",
+                            options=selected_sorted,
+                            index=t0_index,
+                            format_func=_format_date_label,
+                        )
+                        t1_date = st.selectbox(
+                            "Latest (t1)",
+                            options=selected_sorted,
+                            index=t1_index,
+                            format_func=_format_date_label,
+                        )
+                        use_all_dates = st.checkbox(
+                            "Use all selected dates for trends (multi-date)",
+                            value=True,
+                        )
+                    else:
+                        t0_date = selected_sorted[0]
+                        t1_date = selected_sorted[0]
+                        st.info("Select at least two dates to enable t0/t1 comparison.")
+                    map_default = t1_date if t1_date in ndvi_dates_selected else ndvi_dates_selected[0]
+                    ndvi_map_date = st.selectbox(
+                        "Map NDVI date",
+                        options=ndvi_dates_selected,
+                        index=ndvi_dates_selected.index(map_default),
+                        format_func=_format_date_label,
+                    )
+                    with st.expander("Resolved NDVI paths", expanded=False):
+                        for date_key in ndvi_dates_selected:
+                            entry = meta.get(date_key)
+                            if entry and entry.selected_path:
+                                size_mb = (entry.file_size or 0) / (1024 * 1024)
+                                st.caption(
+                                    f"{_format_date_label(date_key)} → {entry.selected_path} "
+                                    f"({size_mb:.2f} MB)"
+                                )
+                else:
+                    st.info("Select at least one NDVI date to continue.")
+            ndvi_stack = [
+                {
+                    "date": date_key,
+                    "date_label": _format_date_label(date_key),
+                    "path": inventory.get(date_key, ""),
+                }
+                for date_key in ndvi_dates_selected
+                if inventory.get(date_key)
+            ]
+            ndvi_path_input = inventory.get(ndvi_map_date or "", "")
+        else:
+            fallback_default = ndvi_default or st.session_state.get("uploaded_ndvi_path", "")
+            ndvi_path_input = st.text_input("NDVI GeoTIFF path", value=fallback_default)
+
         enable_ndvi_overlay = st.checkbox("Enable NDVI overlay (experimental)", value=False)
-        if ndvi_detection.path:
+        if ndvi_by_date and ndvi_map_date:
+            st.caption(f"Scene date: {_format_date_label(ndvi_map_date)}")
+            if ndvi_path_input:
+                st.caption(f"Scene folder: {Path(ndvi_path_input).parent}")
+        elif ndvi_detection.path:
             st.caption(f"Scene date: {ndvi_detection.scene_date}")
             st.caption(f"Scene folder: {ndvi_detection.scene_folder}")
         else:
@@ -1045,8 +1331,47 @@ def main() -> None:
         run_scoring = st.button("Run scoring")
         show_buffers = st.checkbox("Show buffer polygons", value=True)
         show_debug = st.checkbox("Show debug details", value=False)
+        with st.expander("Data Sources", expanded=False):
+            st.subheader("Local inventory")
+            if ndvi_by_date and ndvi_date_meta:
+                st.caption(f"Detected dates: {len(ndvi_date_meta)}")
+                invalid_dates = [
+                    date_key
+                    for date_key, entry in ndvi_date_meta.items()
+                    if entry.selected_path is None
+                ]
+                if invalid_dates:
+                    st.warning(
+                        "Missing/invalid NDVI for: "
+                        + ", ".join(_format_date_label(date_key) for date_key in invalid_dates)
+                    )
+            if st.button("Open base folder"):
+                st.info(f"Open in Explorer: {selected_base_dir}")
+            uploaded = st.file_uploader("Import NDVI GeoTIFF", type=["tif", "tiff"])
+            if uploaded is not None:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded.name).suffix) as tmp_file:
+                    tmp_file.write(uploaded.getbuffer())
+                    st.session_state["uploaded_ndvi_path"] = tmp_file.name
+                    st.success(f"Imported NDVI saved to {tmp_file.name}")
+            st.subheader("Online sources (scaffold)")
+            provider = st.selectbox(
+                "Provider",
+                options=[
+                    "Copernicus Data Space",
+                    "AWS Open Data",
+                    "Sentinel Hub",
+                ],
+            )
+            st.text_input("AOI bbox (minLon,minLat,maxLon,maxLat)", value="")
+            today = datetime.utcnow().date()
+            st.date_input("Date range", value=(today, today))
+            st.slider("Cloud cover max (%)", min_value=0, max_value=100, value=20)
+            st.info(
+                f"Downloader for {provider} is not yet implemented. "
+                "Configure credentials in .env and use scripts/download_s2.py in a future release."
+            )
 
-    ndvi_path = Path(ndvi_path_input).expanduser()
+    ndvi_path = Path(ndvi_path_input).expanduser() if ndvi_path_input else None
     lines_path = Path(lines_path_input).expanduser()
     risk_path = Path(risk_path_input).expanduser() if risk_path_input else None
 
@@ -1058,12 +1383,12 @@ def main() -> None:
     ndvi_bounds = None
     ndvi_bounds_wgs84 = None
 
-    if ndvi_path_input and ndvi_path.exists():
+    if ndvi_path and ndvi_path.exists():
         ndvi_crs, ndvi_bounds, ndvi_bounds_wgs84 = read_ndvi_metadata(ndvi_path)
 
     if enable_ndvi_overlay:
         logger.info("ndvi_overlay_enabled path=%s", ndvi_path)
-        if ndvi_path_input and ndvi_path.exists():
+        if ndvi_path and ndvi_path.exists():
             ndvi_overlay = load_ndvi_overlay(ndvi_path)
             if ndvi_overlay:
                 ndvi_crs = ndvi_overlay[2]
@@ -1108,8 +1433,53 @@ def main() -> None:
             lines_warning = "Paste coordinate lines to define a segment."
 
     results: list[dict[str, Any]] = []
+    trend_rows: list[dict[str, Any]] = []
+    results_by_date: dict[str, list[dict[str, Any]]] = {}
     if lines_payload and (run_scoring or not (risk_path and risk_path.exists())):
-        if ndvi_path.exists():
+        if ndvi_by_date and ndvi_stack:
+            if not ndvi_dates_selected:
+                st.warning("Select at least one NDVI date to compute risk scores.")
+            else:
+                try:
+                    source_crs = lines_crs or detect_geojson_crs(lines_payload, ndvi_crs)
+                    target_crs = source_crs if len(ndvi_stack) > 1 else (ndvi_crs or source_crs)
+                    scoring_path = prepare_lines_for_scoring(lines_payload, source_crs, target_crs)
+                    if use_all_dates:
+                        scoring_dates = ndvi_dates_selected
+                    else:
+                        scoring_dates = [
+                            date_key
+                            for date_key in {t0_date, t1_date, ndvi_map_date}
+                            if date_key
+                        ]
+                    for date_key in scoring_dates:
+                        entry = next((item for item in ndvi_stack if item["date"] == date_key), None)
+                        if not entry:
+                            continue
+                        ndvi_path_for_date = Path(entry["path"]).expanduser()
+                        if not ndvi_path_for_date.exists():
+                            st.warning(f"NDVI path not found for {date_key}: {entry['path']}")
+                            continue
+                        date_results = score_traction_segments(
+                            ndvi_path_for_date,
+                            scoring_path,
+                            buffer_m=buffer_m,
+                            lines_crs=source_crs,
+                        )
+                        for row in date_results:
+                            row["date"] = date_key
+                            row["date_label"] = entry["date_label"]
+                        results_by_date[date_key] = date_results
+                        trend_rows.extend(date_results)
+                    if ndvi_map_date and ndvi_map_date in results_by_date:
+                        results = results_by_date[ndvi_map_date]
+                    elif results_by_date:
+                        results = next(iter(results_by_date.values()))
+                    if results:
+                        st.info("Scoring computed from NDVI dates and traction lines.")
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Scoring failed: {exc}")
+        elif ndvi_path and ndvi_path.exists():
             try:
                 source_crs = lines_crs or detect_geojson_crs(lines_payload, ndvi_crs)
                 scoring_path = prepare_lines_for_scoring(lines_payload, source_crs, ndvi_crs or source_crs)
@@ -1133,6 +1503,11 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001
         st.error(f"Failed to prepare risk table: {exc}")
         results_df = pd.DataFrame()
+
+    trend_df = build_trend_table(trend_rows)
+    delta_df = pd.DataFrame()
+    if ndvi_by_date and t0_date and t1_date and t0_date != t1_date:
+        delta_df = build_delta_table(trend_df, t0_date, t1_date)
 
     if not results_df.empty:
         no_data_mask = results_df["data_status"] == "NO_DATA"
@@ -1187,7 +1562,7 @@ def main() -> None:
                         ndvi_bounds.top,
                     )
                     debug_payload["line_overlaps_ndvi"] = bounds_overlap(line_bounds, ndvi_bounds_tuple)
-            if ndvi_path.exists():
+            if ndvi_path and ndvi_path.exists():
                 from shapely.geometry import shape
 
                 first_feature = next(
@@ -1338,6 +1713,32 @@ def main() -> None:
             st.dataframe(display_df, use_container_width=True)
         else:
             st.info("No risk results to display yet.")
+        if ndvi_by_date and not trend_df.empty:
+            st.subheader("Trend Details")
+            trend_display_cols = [
+                "date_label",
+                "segment_id",
+                "mean_ndvi",
+                "p90_ndvi",
+                "pct_above_0_6",
+                "risk_score",
+                "risk_category",
+                "data_status",
+            ]
+            trend_display = trend_df[trend_display_cols].rename(
+                columns={"date_label": "date"}
+            )
+            st.dataframe(trend_display, use_container_width=True)
+            if not delta_df.empty:
+                st.subheader("Change (t1 - t0)")
+                delta_columns = [
+                    "segment_id",
+                    "delta_mean_ndvi",
+                    "delta_p90_ndvi",
+                    "delta_pct_above_0_6",
+                    "delta_risk_score",
+                ]
+                st.dataframe(delta_df[delta_columns], use_container_width=True)
 
 
 if __name__ == "__main__":
