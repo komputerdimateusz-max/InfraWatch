@@ -28,6 +28,7 @@ from folium.features import GeoJsonTooltip
 from folium.plugins import Draw
 from streamlit_folium import st_folium
 
+from infrawatch.downloader import DownloaderError, Scene, download_scene, search_scenes
 from infrawatch.scoring import score_traction_segments
 from infrawatch.scoring.traction_risk import sample_ndvi_for_line
 from infrawatch.utils.crs import normalize_crs, to_crs_transformer, transform_bounds_always_xy
@@ -1148,6 +1149,41 @@ def update_view_from_output(map_output: dict[str, Any] | None) -> None:
     st.session_state["map_view_seq"] = st.session_state.get("map_view_seq", 0) + 1
 
 
+def _utm_epsg_from_lonlat(lon: float, lat: float) -> int:
+    zone = int((lon + 180) / 6) + 1
+    return 32600 + zone if lat >= 0 else 32700 + zone
+
+
+def _buffered_bbox_from_drawn_features(
+    drawn_features: dict[str, Any], buffer_m: float
+) -> tuple[float, float, float, float] | None:
+    from pyproj import CRS
+    from shapely.geometry import shape
+    from shapely.ops import unary_union
+
+    features = drawn_features.get("features") if drawn_features else []
+    if not features:
+        return None
+    geometries = [shape(feature["geometry"]) for feature in features if feature.get("geometry")]
+    if not geometries:
+        return None
+
+    unioned = unary_union(geometries)
+    if unioned.is_empty:
+        return None
+
+    centroid = unioned.centroid
+    utm_epsg = _utm_epsg_from_lonlat(centroid.x, centroid.y)
+    wgs84 = CRS.from_epsg(4326)
+    utm = CRS.from_epsg(utm_epsg)
+    to_utm = to_crs_transformer(wgs84, utm)
+    to_wgs = to_crs_transformer(utm, wgs84)
+    projected = transform_geometry(unioned, to_utm)
+    buffered = projected.buffer(buffer_m) if buffer_m > 0 else projected
+    buffered_wgs = transform_geometry(buffered, to_wgs)
+    return buffered_wgs.bounds
+
+
 def main() -> None:
     st.set_page_config(page_title="InfraWatch MVP", layout="wide")
     st.title("InfraWatch — Traction Vegetation Risk")
@@ -1186,6 +1222,12 @@ def main() -> None:
         st.session_state["map_view_seq"] = 0
     if "drawn_lines_fc_wgs84" in st.session_state and not st.session_state["drawn_features"].get("features"):
         st.session_state["drawn_features"] = st.session_state["drawn_lines_fc_wgs84"]
+    if "downloader_scenes" not in st.session_state:
+        st.session_state["downloader_scenes"] = []
+    if "downloader_logs" not in st.session_state:
+        st.session_state["downloader_logs"] = []
+    if "downloader_last_error" not in st.session_state:
+        st.session_state["downloader_last_error"] = None
 
     ndvi_stack: list[dict[str, str]] = []
     ndvi_date_meta: dict[str, NdviScanMeta] = {}
@@ -1214,13 +1256,19 @@ def main() -> None:
                     "with NDVI GeoTIFFs inside."
                 )
             if dates_sorted:
-                default_selection = dates_sorted[:2] if len(dates_sorted) >= 2 else dates_sorted
-                ndvi_dates_selected = st.multiselect(
+                existing_selection = st.session_state.get("ndvi_dates_selected")
+                if existing_selection:
+                    default_selection = [date_key for date_key in existing_selection if date_key in dates_sorted]
+                else:
+                    default_selection = dates_sorted[:2] if len(dates_sorted) >= 2 else dates_sorted
+                st.multiselect(
                     "NDVI dates",
                     options=dates_sorted,
                     default=default_selection,
                     format_func=_format_date_label,
+                    key="ndvi_dates_selected",
                 )
+                ndvi_dates_selected = st.session_state.get("ndvi_dates_selected", [])
                 if ndvi_dates_selected:
                     selected_sorted = sorted(ndvi_dates_selected)
                     if len(selected_sorted) >= 2:
@@ -1246,12 +1294,15 @@ def main() -> None:
                         t0_date = selected_sorted[0]
                         t1_date = selected_sorted[0]
                         st.info("Select at least two dates to enable t0/t1 comparison.")
-                    map_default = t1_date if t1_date in ndvi_dates_selected else ndvi_dates_selected[0]
+                    map_default = st.session_state.get("ndvi_map_date")
+                    if map_default not in ndvi_dates_selected:
+                        map_default = t1_date if t1_date in ndvi_dates_selected else ndvi_dates_selected[0]
                     ndvi_map_date = st.selectbox(
                         "Map NDVI date",
                         options=ndvi_dates_selected,
                         index=ndvi_dates_selected.index(map_default),
                         format_func=_format_date_label,
+                        key="ndvi_map_date",
                     )
                     with st.expander("Resolved NDVI paths", expanded=False):
                         for date_key in ndvi_dates_selected:
@@ -1300,6 +1351,114 @@ def main() -> None:
                     st.success(f"Generated demo segment at {generated}")
             else:
                 st.warning("NDVI path not found; unable to generate demo segment.")
+        buffer_m = st.slider("Buffer distance (meters)", min_value=1, max_value=100, value=20)
+        st.subheader("NDVI Downloader")
+        aoi_mode = st.radio(
+            "AOI source",
+            options=["Use drawn line buffer bbox", "Manual bbox input"],
+            index=0,
+        )
+        aoi_bbox = None
+        if aoi_mode == "Use drawn line buffer bbox":
+            aoi_bbox = _buffered_bbox_from_drawn_features(
+                st.session_state.get("drawn_features", _empty_feature_collection()),
+                buffer_m,
+            )
+            if aoi_bbox:
+                st.caption(
+                    "Buffered bbox (min_lon, min_lat, max_lon, max_lat): "
+                    f"{aoi_bbox[0]:.5f}, {aoi_bbox[1]:.5f}, {aoi_bbox[2]:.5f}, {aoi_bbox[3]:.5f}"
+                )
+            else:
+                st.info("Draw a line on the map to use its buffered bbox for downloads.")
+        else:
+            col_min, col_max = st.columns(2)
+            with col_min:
+                min_lon = st.number_input("Min lon", value=0.0, format="%.6f")
+                min_lat = st.number_input("Min lat", value=0.0, format="%.6f")
+            with col_max:
+                max_lon = st.number_input("Max lon", value=0.0, format="%.6f")
+                max_lat = st.number_input("Max lat", value=0.0, format="%.6f")
+            if min_lon < max_lon and min_lat < max_lat:
+                aoi_bbox = (min_lon, min_lat, max_lon, max_lat)
+            else:
+                st.warning("Manual bbox is invalid (min must be less than max).")
+
+        today = datetime.utcnow().date()
+        default_start = today.replace(day=max(1, today.day - 15))
+        date_range = st.date_input("Date range", value=(default_start, today), max_value=today)
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            start_date, end_date = date_range
+        else:
+            start_date = end_date = today
+        cloud_max = st.slider("Cloud cover max (%)", min_value=0, max_value=100, value=20)
+        backend = st.selectbox(
+            "Source backend",
+            options=["Copernicus Data Space (CDSE)", "AWS Open Data (Earth Search)"],
+            index=1,
+        )
+
+        search_disabled = aoi_bbox is None
+        if st.button("Search", disabled=search_disabled):
+            try:
+                st.session_state["downloader_last_error"] = None
+                st.session_state["downloader_logs"] = []
+                with st.spinner("Searching scenes..."):
+                    scenes = search_scenes(aoi_bbox, (start_date, end_date), cloud_max, backend)
+                st.session_state["downloader_scenes"] = scenes
+                if not scenes:
+                    st.info("No scenes found for the selected filters.")
+            except DownloaderError as exc:
+                st.session_state["downloader_last_error"] = str(exc)
+                st.session_state["downloader_scenes"] = []
+
+        if st.session_state.get("downloader_last_error"):
+            st.error(st.session_state["downloader_last_error"])
+            if backend == "Copernicus Data Space (CDSE)":
+                st.info("Try AWS Open Data (Earth Search) or verify CDSE credentials in .env.")
+
+        scenes: list[Scene] = st.session_state.get("downloader_scenes", [])
+        if scenes:
+            with st.expander(f"Search results ({len(scenes)})", expanded=True):
+                for idx, scene in enumerate(scenes):
+                    scene_date = scene.date.strftime("%Y-%m-%d")
+                    cloud_label = (
+                        f"{scene.cloud_cover:.1f}%"
+                        if isinstance(scene.cloud_cover, (int, float))
+                        else "n/a"
+                    )
+                    title = f"{scene_date} | tile {scene.tile_id or 'unknown'} | cloud {cloud_label}"
+                    col_info, col_action = st.columns([3, 1])
+                    with col_info:
+                        st.write(title)
+                        if scene.preview:
+                            st.caption(f"Preview: {scene.preview}")
+                    with col_action:
+                        if st.button("Download", key=f"download_scene_{idx}"):
+                            base_path = Path(selected_base_dir).expanduser()
+                            safe_scene_id = re.sub(r"[^A-Za-z0-9_-]+", "_", scene.scene_id)
+                            date_folder = scene.date.strftime("%Y%m%d")
+                            target_dir = base_path / date_folder / safe_scene_id
+                            try:
+                                with st.spinner("Downloading and computing NDVI..."):
+                                    ndvi_path = download_scene(scene, target_dir)
+                                st.success(f"Saved NDVI to {ndvi_path}")
+                                st.session_state["ndvi_dates_selected"] = sorted(
+                                    set(
+                                        (st.session_state.get("ndvi_dates_selected") or [])
+                                        + [date_folder]
+                                    )
+                                )
+                                st.session_state["ndvi_map_date"] = date_folder
+                                st.cache_data.clear()
+                                st.rerun()
+                            except DownloaderError as exc:
+                                st.error(str(exc))
+                                if scene.backend == "Copernicus Data Space (CDSE)":
+                                    st.info(
+                                        "If CDSE fails, try AWS Open Data or verify credentials in .env."
+                                    )
+        st.divider()
         traction_mode = st.selectbox(
             "Traction input mode",
             options=["From file", "Draw on map", "Paste coordinates"],
@@ -1326,7 +1485,6 @@ def main() -> None:
                 height=160,
             )
         risk_path_input = st.text_input("Risk JSON path", value=risk_default)
-        buffer_m = st.slider("Buffer distance (meters)", min_value=1, max_value=100, value=20)
         opacity = st.slider("NDVI overlay opacity", min_value=0.1, max_value=1.0, value=0.6)
         run_scoring = st.button("Run scoring")
         show_buffers = st.checkbox("Show buffer polygons", value=True)
@@ -1353,23 +1511,6 @@ def main() -> None:
                     tmp_file.write(uploaded.getbuffer())
                     st.session_state["uploaded_ndvi_path"] = tmp_file.name
                     st.success(f"Imported NDVI saved to {tmp_file.name}")
-            st.subheader("Online sources (scaffold)")
-            provider = st.selectbox(
-                "Provider",
-                options=[
-                    "Copernicus Data Space",
-                    "AWS Open Data",
-                    "Sentinel Hub",
-                ],
-            )
-            st.text_input("AOI bbox (minLon,minLat,maxLon,maxLat)", value="")
-            today = datetime.utcnow().date()
-            st.date_input("Date range", value=(today, today))
-            st.slider("Cloud cover max (%)", min_value=0, max_value=100, value=20)
-            st.info(
-                f"Downloader for {provider} is not yet implemented. "
-                "Configure credentials in .env and use scripts/download_s2.py in a future release."
-            )
 
     ndvi_path = Path(ndvi_path_input).expanduser() if ndvi_path_input else None
     lines_path = Path(lines_path_input).expanduser()
