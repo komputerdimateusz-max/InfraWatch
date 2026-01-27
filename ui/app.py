@@ -27,6 +27,7 @@ import pandas as pd
 import streamlit as st
 from folium.features import GeoJsonTooltip
 from folium.plugins import Draw
+from streamlit.errors import StreamlitSecretNotFoundError
 from streamlit_folium import st_folium
 
 from infrawatch.scoring import score_traction_segments
@@ -238,6 +239,18 @@ def _get_logger() -> logging.Logger:
     logger.addHandler(handler)
     logger.propagate = False
     return logger
+
+
+def get_secret(key: str, default: str = "") -> str:
+    value = os.getenv(key)
+    if value:
+        return value
+    try:
+        return st.secrets.get(key, default)
+    except StreamlitSecretNotFoundError:
+        return default
+    except Exception:  # noqa: BLE001
+        return default
 
 
 def _parse_scene_date(path: Path) -> datetime | None:
@@ -1197,8 +1210,8 @@ def _buffered_bbox_from_drawn_features(
 
 
 def _cdse_credentials_available() -> bool:
-    username = os.getenv("COPERNICUS_USERNAME") or st.secrets.get("COPERNICUS_USERNAME", "")
-    password = os.getenv("COPERNICUS_PASSWORD") or st.secrets.get("COPERNICUS_PASSWORD", "")
+    username = get_secret("COPERNICUS_USERNAME")
+    password = get_secret("COPERNICUS_PASSWORD")
     return bool(username and password)
 
 
@@ -1449,6 +1462,17 @@ def main() -> None:
                 if aoi_bbox is None:
                     missing_reasons.append("Provide a valid manual bbox (min values must be less than max values).")
 
+            cdse_credentials_available = _cdse_credentials_available()
+            if backend == "Copernicus Data Space (CDSE)" and not cdse_credentials_available:
+                missing_reasons.append(
+                    "CDSE credentials not configured. Add env vars "
+                    "COPERNICUS_USERNAME/PASSWORD or .streamlit/secrets.toml."
+                )
+                st.warning(
+                    "CDSE credentials not configured. Add env vars "
+                    "COPERNICUS_USERNAME/PASSWORD or .streamlit/secrets.toml."
+                )
+
             search_enabled = not missing_reasons
             st.session_state["downloader_validation"] = {
                 "search_enabled": search_enabled,
@@ -1464,13 +1488,6 @@ def main() -> None:
             if missing_reasons:
                 st.warning("Search disabled until the following are resolved:")
                 st.markdown("\n".join(f"- {reason}" for reason in missing_reasons))
-
-            cdse_credentials_available = _cdse_credentials_available()
-            if backend == "Copernicus Data Space (CDSE)" and not cdse_credentials_available:
-                st.info(
-                    "CDSE credentials not configured; search may fail. "
-                    "Set COPERNICUS_USERNAME and COPERNICUS_PASSWORD in .env or Streamlit secrets."
-                )
 
             search_disabled = not search_enabled
             if st.button("Search", disabled=search_disabled):
