@@ -60,6 +60,9 @@ All data is provided by the **Copernicus Programme** and can be used for **comme
 The Streamlit UI now includes a **NDVI Downloader** sidebar section for pulling additional
 Sentinel-2 scenes and generating `ndvi.tif` files automatically.
 
+> **Optional dependency:** Install the downloader extras with `pip install -e .[downloader]`
+> (or `pip install pystac-client`) to enable the downloader search and download features.
+
 ### Workflow
 1. **Draw a line** on the map (or enter a manual bbox) so the downloader knows the AOI.
 2. In the sidebar, open **NDVI Downloader** and choose:
@@ -239,6 +242,5 @@ Project status: **Early development / MVP**
 
 ## 📬 Contact
 Repository owner: InfraWatch  
-
 
 
