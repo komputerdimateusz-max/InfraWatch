@@ -49,6 +49,9 @@ DEMO_SEGMENT_HALF_LENGTH_M = 100.0
 DEMO_SEGMENT_HALF_WIDTH_M = 50.0
 DEMO_SEGMENT_MARGIN_FRACTION = 0.1
 DEMO_SEGMENT_MARGIN_M = 75.0
+MAP_COMPONENT_KEY = "main_map"
+MAP_CENTER_EPSILON = 1e-6
+MAP_ZOOM_EPSILON = 0.01
 
 
 def _get_logger() -> logging.Logger:
@@ -610,6 +613,10 @@ def _build_line_feature_collection(features: list[dict[str, Any]]) -> dict[str, 
     return {"type": "FeatureCollection", "features": features}
 
 
+def _empty_feature_collection() -> dict[str, Any]:
+    return {"type": "FeatureCollection", "features": []}
+
+
 def _geometry_key(geometry: dict[str, Any]) -> str:
     normalized = normalize_geojson_coordinates(geometry)
     payload = json.dumps(normalized, sort_keys=True)
@@ -649,6 +656,7 @@ def _assign_segment_ids(features: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return assigned
+
 
 def _build_line_feature(
     geometry: dict[str, Any],
@@ -791,6 +799,7 @@ def create_map(
     opacity: float,
     fit_bounds: list[list[float]] | None,
     enable_drawing: bool,
+    drawn_feature_collection: dict[str, Any] | None,
     map_center: dict[str, float] | None,
     map_zoom: int | float | None,
 ) -> folium.Map:
@@ -860,6 +869,13 @@ def create_map(
             tooltip=tooltip,
         ).add_to(fmap)
 
+    if enable_drawing and drawn_feature_collection and drawn_feature_collection.get("features"):
+        folium.GeoJson(
+            drawn_feature_collection,
+            name="Drawn Lines",
+            style_function=lambda feature: {"color": "#1f78b4", "weight": 3},
+        ).add_to(fmap)
+
     if show_buffers and buffer_features:
         folium.GeoJson(
             build_feature_collection(buffer_features),
@@ -892,6 +908,58 @@ def create_map(
     return fmap
 
 
+def _normalize_map_center(center: Any) -> dict[str, float] | None:
+    if not isinstance(center, dict):
+        return None
+    lat = center.get("lat")
+    lng = center.get("lng")
+    if not isinstance(lat, (int, float)) or not isinstance(lng, (int, float)):
+        return None
+    if not (-LATITUDE_LIMIT_DEG <= lat <= LATITUDE_LIMIT_DEG):
+        return None
+    if not (-LONGITUDE_LIMIT_DEG <= lng <= LONGITUDE_LIMIT_DEG):
+        return None
+    return {"lat": float(lat), "lng": float(lng)}
+
+
+def _map_center_distance(a: dict[str, float] | None, b: dict[str, float] | None) -> float:
+    if not a or not b:
+        return float("inf")
+    return abs(a["lat"] - b["lat"]) + abs(a["lng"] - b["lng"])
+
+
+def update_view_from_output(map_output: dict[str, Any] | None) -> None:
+    if not map_output:
+        return
+    center_candidate = map_output.get("center") or map_output.get("last_center")
+    zoom_candidate = map_output.get("zoom")
+    if zoom_candidate is None:
+        zoom_candidate = map_output.get("last_zoom")
+
+    next_center = _normalize_map_center(center_candidate)
+    next_zoom = float(zoom_candidate) if isinstance(zoom_candidate, (int, float)) else None
+
+    current_center = st.session_state.get("map_center")
+    current_zoom = st.session_state.get("map_zoom")
+
+    center_changed = (
+        next_center is not None
+        and _map_center_distance(next_center, current_center) > MAP_CENTER_EPSILON
+    )
+    zoom_changed = next_zoom is not None and (
+        current_zoom is None or abs(next_zoom - float(current_zoom)) > MAP_ZOOM_EPSILON
+    )
+
+    if not (center_changed or zoom_changed):
+        return
+
+    if center_changed:
+        st.session_state["map_center"] = next_center
+    if zoom_changed:
+        st.session_state["map_zoom"] = next_zoom
+    st.session_state["map_view_seq"] = st.session_state.get("map_view_seq", 0) + 1
+
+
 def main() -> None:
     st.set_page_config(page_title="InfraWatch MVP", layout="wide")
     st.title("InfraWatch — Traction Vegetation Risk")
@@ -915,12 +983,14 @@ def main() -> None:
     if "lines_path" not in st.session_state:
         st.session_state["lines_path"] = lines_default
     if "drawn_features" not in st.session_state:
-        st.session_state["drawn_features"] = {}
+        st.session_state["drawn_features"] = _empty_feature_collection()
     if "map_center" not in st.session_state:
         st.session_state["map_center"] = None
     if "map_zoom" not in st.session_state:
         st.session_state["map_zoom"] = None
-    if "drawn_lines_fc_wgs84" in st.session_state and not st.session_state["drawn_features"]:
+    if "map_view_seq" not in st.session_state:
+        st.session_state["map_view_seq"] = 0
+    if "drawn_lines_fc_wgs84" in st.session_state and not st.session_state["drawn_features"].get("features"):
         st.session_state["drawn_features"] = st.session_state["drawn_lines_fc_wgs84"]
 
     with st.sidebar:
@@ -951,8 +1021,10 @@ def main() -> None:
         )
         if traction_mode == "Draw on map":
             if st.button("Clear drawn lines"):
-                st.session_state["drawn_features"] = {}
+                st.session_state["drawn_features"] = _empty_feature_collection()
+                st.session_state["risk_results"] = None
                 st.session_state.pop("drawn_lines_path", None)
+                st.rerun()
         lines_path_input = st.text_input("Traction lines GeoJSON path", key="lines_path")
         coordinate_format = None
         coordinate_text = None
@@ -1014,8 +1086,8 @@ def main() -> None:
             st.error("Traction lines GeoJSON not found.")
     elif traction_mode == "Draw on map":
         # Read previously drawn segments captured from the folium draw tool.
-        drawings = st.session_state.get("drawn_features", {})
-        if drawings:
+        drawings = st.session_state.get("drawn_features", _empty_feature_collection())
+        if drawings.get("features"):
             lines_payload = dict(drawings)
             lines_payload["_path"] = st.session_state.get("drawn_lines_path", "")
             lines_crs = normalize_crs("EPSG:4326")
@@ -1085,16 +1157,21 @@ def main() -> None:
             }
         if ndvi_bounds_wgs84 is not None:
             debug_payload["ndvi_bounds_wgs84"] = ndvi_bounds_wgs84
-        if traction_mode == "Draw on map":
-            stored = st.session_state.get("drawn_features", {})
-            stored_features = stored.get("features", [])
-            debug_payload["stored_drawn_count"] = len(stored_features)
-            debug_payload["stored_drawn_types"] = [
-                (feature.get("geometry") or {}).get("type") for feature in stored_features
-            ]
-            debug_payload["session_map_center"] = st.session_state.get("map_center")
-            debug_payload["session_map_zoom"] = st.session_state.get("map_zoom")
-            debug_payload["last_map_output_keys"] = st.session_state.get("last_map_output_keys", [])
+        stored = st.session_state.get("drawn_features", {})
+        stored_features = stored.get("features", [])
+        debug_payload["stored_drawn_count"] = len(stored_features)
+        debug_payload["stored_drawn_types"] = [
+            (feature.get("geometry") or {}).get("type") for feature in stored_features
+        ]
+        debug_payload["session_map_center"] = st.session_state.get("map_center")
+        debug_payload["session_map_zoom"] = st.session_state.get("map_zoom")
+        debug_payload["last_map_output_keys"] = st.session_state.get("last_map_output_keys", [])
+        debug_payload["last_map_output_has_all_drawings"] = st.session_state.get(
+            "last_map_output_has_all_drawings", False
+        )
+        debug_payload["last_map_output_has_last_active_drawing"] = st.session_state.get(
+            "last_map_output_has_last_active_drawing", False
+        )
         if lines_payload:
             source_crs = lines_crs or detect_geojson_crs(lines_payload, ndvi_crs)
             debug_payload["lines_source_crs"] = source_crs.to_string() if source_crs else "unknown"
@@ -1180,7 +1257,11 @@ def main() -> None:
             default_center = get_default_view_from_ndvi_bounds(
                 ndvi_bounds_wgs84, map_features
             )
-            map_center = st.session_state.get("map_center") or default_center
+            if st.session_state.get("map_center") is None and default_center:
+                st.session_state["map_center"] = default_center
+            if st.session_state.get("map_zoom") is None and default_center:
+                st.session_state["map_zoom"] = 10
+            map_center = st.session_state.get("map_center")
             fmap = create_map(
                 ndvi_overlay=ndvi_overlay,
                 line_features=map_features,
@@ -1189,36 +1270,39 @@ def main() -> None:
                 opacity=opacity,
                 fit_bounds=fit_bounds,
                 enable_drawing=traction_mode == "Draw on map",
+                drawn_feature_collection=st.session_state.get("drawn_features"),
                 map_center=map_center,
                 map_zoom=st.session_state.get("map_zoom"),
             )
-            map_output = st_folium(fmap, width=800, height=600, key="traction_map")
+            map_output = st_folium(
+                fmap,
+                width=800,
+                height=600,
+                key=MAP_COMPONENT_KEY,
+                returned_objects=["all_drawings", "last_active_drawing"],
+            )
             if map_output:
                 st.session_state["last_map_output_keys"] = sorted(map_output.keys())
-                center = map_output.get("center")
-                zoom = map_output.get("zoom")
-                if isinstance(center, dict) and "lat" in center and "lng" in center:
-                    st.session_state["map_center"] = center
-                if isinstance(zoom, (int, float)):
-                    st.session_state["map_zoom"] = zoom
+                st.session_state["last_map_output_has_all_drawings"] = "all_drawings" in map_output
+                st.session_state["last_map_output_has_last_active_drawing"] = (
+                    "last_active_drawing" in map_output
+                )
+                update_view_from_output(map_output)
             if traction_mode == "Draw on map":
                 # Capture drawn lines so they persist across reruns (debug toggles, sliders, etc.).
                 if map_output and ("all_drawings" in map_output or "last_active_drawing" in map_output):
                     new_payload = normalize_drawings_to_featurecollection(map_output)
-                    if "all_drawings" in map_output:
-                        updated_payload = new_payload
-                    else:
-                        updated_payload = merge_lines(
-                            st.session_state.get("drawn_features"), new_payload
-                        )
-                    if updated_payload.get("features"):
+                    if new_payload.get("features"):
+                        if "all_drawings" in map_output:
+                            updated_payload = new_payload
+                        else:
+                            updated_payload = merge_lines(
+                                st.session_state.get("drawn_features"), new_payload
+                            )
                         st.session_state["drawn_features"] = updated_payload
                         st.session_state["drawn_lines_path"] = str(
                             _write_temp_geojson(updated_payload)
                         )
-                    elif "all_drawings" in map_output:
-                        st.session_state["drawn_features"] = {}
-                        st.session_state.pop("drawn_lines_path", None)
         except Exception as exc:  # noqa: BLE001
             st.error(f"Failed to render map: {exc}")
 
