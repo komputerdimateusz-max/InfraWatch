@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 import re
 import tempfile
 from dataclasses import dataclass
@@ -1195,6 +1196,12 @@ def _buffered_bbox_from_drawn_features(
     return buffered_wgs.bounds
 
 
+def _cdse_credentials_available() -> bool:
+    username = os.getenv("COPERNICUS_USERNAME") or st.secrets.get("COPERNICUS_USERNAME", "")
+    password = os.getenv("COPERNICUS_PASSWORD") or st.secrets.get("COPERNICUS_PASSWORD", "")
+    return bool(username and password)
+
+
 def main() -> None:
     st.set_page_config(page_title="InfraWatch MVP", layout="wide")
     st.title("InfraWatch — Traction Vegetation Risk")
@@ -1377,10 +1384,11 @@ def main() -> None:
                 options=["Use drawn line buffer bbox", "Manual bbox input"],
                 index=0,
             )
+            drawn_features = st.session_state.get("drawn_features", _empty_feature_collection())
             aoi_bbox = None
             if aoi_mode == "Use drawn line buffer bbox":
                 aoi_bbox = _buffered_bbox_from_drawn_features(
-                    st.session_state.get("drawn_features", _empty_feature_collection()),
+                    drawn_features,
                     buffer_m,
                 )
                 if aoi_bbox:
@@ -1418,7 +1426,53 @@ def main() -> None:
                 index=1,
             )
 
-            search_disabled = aoi_bbox is None
+            missing_reasons: list[str] = []
+            if not backend:
+                missing_reasons.append("Select a source backend.")
+
+            date_range_valid = isinstance(date_range, tuple) and len(date_range) == 2
+            if not date_range_valid:
+                missing_reasons.append("Select a valid start and end date.")
+            elif start_date > end_date:
+                missing_reasons.append("Ensure the start date is on or before the end date.")
+
+            if not (0 <= cloud_max <= 100):
+                missing_reasons.append("Set cloud cover between 0 and 100%.")
+
+            if aoi_mode == "Use drawn line buffer bbox":
+                drawn_count = len(drawn_features.get("features", []))
+                if drawn_count == 0:
+                    missing_reasons.append("Draw at least one line on the map to define the AOI.")
+                if aoi_bbox is None:
+                    missing_reasons.append("Buffered AOI bbox could not be computed from drawn lines.")
+            else:
+                if aoi_bbox is None:
+                    missing_reasons.append("Provide a valid manual bbox (min values must be less than max values).")
+
+            search_enabled = not missing_reasons
+            st.session_state["downloader_validation"] = {
+                "search_enabled": search_enabled,
+                "missing_reasons": missing_reasons,
+                "aoi_mode": aoi_mode,
+                "aoi_bbox": aoi_bbox,
+                "backend": backend,
+                "cloud_max": cloud_max,
+                "start_date": str(start_date),
+                "end_date": str(end_date),
+            }
+
+            if missing_reasons:
+                st.warning("Search disabled until the following are resolved:")
+                st.markdown("\n".join(f"- {reason}" for reason in missing_reasons))
+
+            cdse_credentials_available = _cdse_credentials_available()
+            if backend == "Copernicus Data Space (CDSE)" and not cdse_credentials_available:
+                st.info(
+                    "CDSE credentials not configured; search may fail. "
+                    "Set COPERNICUS_USERNAME and COPERNICUS_PASSWORD in .env or Streamlit secrets."
+                )
+
+            search_disabled = not search_enabled
             if st.button("Search", disabled=search_disabled):
                 try:
                     st.session_state["downloader_last_error"] = None
@@ -1708,6 +1762,7 @@ def main() -> None:
         debug_payload["last_map_output_has_last_active_drawing"] = st.session_state.get(
             "last_map_output_has_last_active_drawing", False
         )
+        debug_payload["downloader_validation"] = st.session_state.get("downloader_validation")
         if lines_payload:
             source_crs = lines_crs or detect_geojson_crs(lines_payload, ndvi_crs)
             debug_payload["lines_source_crs"] = source_crs.to_string() if source_crs else "unknown"
