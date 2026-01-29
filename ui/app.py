@@ -16,7 +16,6 @@ import logging
 import os
 import re
 import tempfile
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -30,6 +29,14 @@ from folium.plugins import Draw
 from streamlit.errors import StreamlitSecretNotFoundError
 from streamlit_folium import st_folium
 
+from infrawatch.core.ndvi_io import (
+    DEFAULT_NDVI_BASE_DIR,
+    NdviDetection,
+    NdviScanMeta,
+    detect_latest_ndvi as core_detect_latest_ndvi,
+    format_date_label as _format_date_label,
+    scan_ndvi_inventory as core_scan_ndvi_inventory,
+)
 from infrawatch.scoring import score_traction_segments
 from infrawatch.scoring.traction_risk import sample_ndvi_for_line
 from infrawatch.utils.crs import normalize_crs, to_crs_transformer, transform_bounds_always_xy
@@ -47,15 +54,6 @@ except Exception as exc:  # noqa: BLE001
     DOWNLOADER_IMPORT_ERROR = exc
 
 
-@dataclass
-class NdviDetection:
-    path: Path | None
-    scene_date: str | None
-    scene_folder: Path | None
-
-
-DATE_PATTERN = re.compile(r"(20\d{6})")
-DATE_FOLDER_PATTERN = re.compile(r"^\d{8}$")
 LOG_PATH = Path("ui_runtime.log")
 DEFAULT_UTM_EPSG = 32633
 LONGITUDE_LIMIT_DEG = 180
@@ -67,164 +65,14 @@ DEMO_SEGMENT_MARGIN_M = 75.0
 MAP_COMPONENT_KEY = "main_map"
 MAP_CENTER_EPSILON = 1e-6
 MAP_ZOOM_EPSILON = 0.01
-DEFAULT_NDVI_BASE_DIR = Path(r"C:\InfraWatch\satellite_data\raw\s2")
-
-
-@dataclass
-class NdviCandidate:
-    path: Path
-    size: int
-    mtime: float
-    reason: str
-    msil2a: bool
-    has_ndvi: bool
-    ndvi_prefix: bool
-
-
-@dataclass
-class NdviScanMeta:
-    selected_path: str | None
-    candidates_count: int
-    reason: str | None
-    file_size: int | None
-    mtime: float | None
-    candidates: list[str]
-    warning: str | None
-
-
-def _format_date_label(date_str: str) -> str:
-    try:
-        return datetime.strptime(date_str, "%Y%m%d").strftime("%Y-%m-%d")
-    except ValueError:
-        return date_str
-
-
-def _rank_candidate(candidate: NdviCandidate) -> tuple[int, int, int, int, float]:
-    return (
-        1 if candidate.msil2a else 0,
-        1 if candidate.has_ndvi else 0,
-        1 if candidate.ndvi_prefix else 0,
-        candidate.size,
-        candidate.mtime,
-    )
-
-
-def _candidate_from_path(path: Path, reason: str) -> NdviCandidate:
-    stat = path.stat()
-    name_lower = path.name.lower()
-    path_lower = str(path).lower()
-    return NdviCandidate(
-        path=path,
-        size=stat.st_size,
-        mtime=stat.st_mtime,
-        reason=reason,
-        msil2a="msil2a" in path_lower,
-        has_ndvi="ndvi" in name_lower,
-        ndvi_prefix=path.name.upper().startswith("NDVI_"),
-    )
-
-
-def _find_ndvi_candidates(date_dir: Path) -> list[NdviCandidate]:
-    tif_paths = [
-        path
-        for path in date_dir.rglob("*")
-        if path.is_file() and path.suffix.lower() in {".tif", ".tiff"}
-    ]
-    primary = [path for path in tif_paths if path.name.lower() == "ndvi.tif"]
-    if primary:
-        return [_candidate_from_path(path, "primary_exact") for path in primary]
-
-    named_ndvi = [path for path in tif_paths if "ndvi" in path.name.lower()]
-    if named_ndvi:
-        return [_candidate_from_path(path, "fallback_ndvi_name") for path in named_ndvi]
-
-    if tif_paths:
-        return [_candidate_from_path(path, "fallback_any_tif") for path in tif_paths]
-    return []
-
-
-def _select_ndvi_candidate(candidates: list[NdviCandidate]) -> tuple[NdviCandidate | None, str | None]:
-    if not candidates:
-        return None, None
-
-    sorted_candidates = sorted(
-        candidates,
-        key=_rank_candidate,
-        reverse=True,
-    )
-    valid_candidates: list[NdviCandidate] = []
-    import rasterio
-
-    for candidate in sorted_candidates:
-        try:
-            with rasterio.open(candidate.path):
-                valid_candidates.append(candidate)
-        except Exception:  # noqa: BLE001
-            continue
-
-    if not valid_candidates:
-        return None, None
-
-    valid_candidates.sort(key=_rank_candidate, reverse=True)
-    selected = valid_candidates[0]
-    top_rank = _rank_candidate(selected)
-    ambiguous = [cand for cand in valid_candidates if _rank_candidate(cand) == top_rank]
-    warning = None
-    if len(ambiguous) > 1:
-        warning = (
-            "Multiple NDVI candidates matched equally; selected best match. "
-            f"Candidates: {', '.join(str(c.path) for c in valid_candidates)}"
-        )
-    return selected, warning
 
 
 @st.cache_data(show_spinner=False)
 def scan_ndvi_inventory(
     base_dir: str,
 ) -> tuple[dict[str, str], list[str], dict[str, NdviScanMeta], list[str]]:
-    base_path = Path(base_dir).expanduser()
-    if not base_path.exists():
-        return {}, [], {}, [f"Base directory not found: {base_path}"]
-
-    date_dirs = [
-        path
-        for path in base_path.iterdir()
-        if path.is_dir() and DATE_FOLDER_PATTERN.match(path.name)
-    ]
-    inventory: dict[str, str] = {}
-    meta: dict[str, NdviScanMeta] = {}
-    warnings: list[str] = []
-
-    for date_dir in sorted(date_dirs, key=lambda p: p.name, reverse=True):
-        candidates = _find_ndvi_candidates(date_dir)
-        selected, warning = _select_ndvi_candidate(candidates)
-        if warning:
-            warnings.append(f"{date_dir.name}: {warning}")
-        if not selected:
-            meta[date_dir.name] = NdviScanMeta(
-                selected_path=None,
-                candidates_count=len(candidates),
-                reason=None,
-                file_size=None,
-                mtime=None,
-                candidates=[str(c.path) for c in candidates],
-                warning=warning,
-            )
-            continue
-
-        inventory[date_dir.name] = str(selected.path)
-        meta[date_dir.name] = NdviScanMeta(
-            selected_path=str(selected.path),
-            candidates_count=len(candidates),
-            reason=selected.reason,
-            file_size=selected.size,
-            mtime=selected.mtime,
-            candidates=[str(c.path) for c in candidates],
-            warning=warning,
-        )
-
-    dates_sorted = sorted(inventory.keys(), reverse=True)
-    return inventory, dates_sorted, meta, warnings
+    inventory = core_scan_ndvi_inventory(base_dir)
+    return inventory.inventory, inventory.dates_sorted, inventory.meta, inventory.warnings
 
 
 def _get_logger() -> logging.Logger:
@@ -253,46 +101,8 @@ def get_secret(key: str, default: str = "") -> str:
         return default
 
 
-def _parse_scene_date(path: Path) -> datetime | None:
-    for part in path.parts:
-        match = DATE_PATTERN.search(part)
-        if match:
-            try:
-                return datetime.strptime(match.group(1), "%Y%m%d")
-            except ValueError:
-                continue
-    return None
-
-
 def detect_latest_ndvi(base_dir: Path) -> NdviDetection:
-    candidates = list(base_dir.rglob("ndvi.tif"))
-    if not candidates:
-        return NdviDetection(path=None, scene_date=None, scene_folder=None)
-
-    dated: list[tuple[datetime, Path]] = []
-    undated: list[Path] = []
-    for path in candidates:
-        parsed = _parse_scene_date(path)
-        if parsed:
-            dated.append((parsed, path))
-        else:
-            undated.append(path)
-
-    if dated:
-        dated.sort(key=lambda item: item[0])
-        scene_date, selected = dated[-1]
-        return NdviDetection(
-            path=selected,
-            scene_date=scene_date.strftime("%Y-%m-%d"),
-            scene_folder=selected.parent,
-        )
-
-    selected = max(undated, key=lambda item: item.stat().st_mtime)
-    return NdviDetection(
-        path=selected,
-        scene_date=datetime.fromtimestamp(selected.stat().st_mtime).strftime("%Y-%m-%d"),
-        scene_folder=selected.parent,
-    )
+    return core_detect_latest_ndvi(base_dir)
 
 
 def load_geojson(path: Path) -> dict[str, Any]:
