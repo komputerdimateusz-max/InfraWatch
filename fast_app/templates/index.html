@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>InfraWatch Fast App</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="app-header">
+    <div>
+      <h1>InfraWatch Fast App</h1>
+      <p class="subtitle">Draw traction segments, score vegetation risk, and review trends.</p>
+    </div>
+    <div class="status-pill" id="healthStatus">Checking health...</div>
+  </header>
+
+  <main class="layout">
+    <section class="sidebar">
+      <div class="card">
+        <h2>Scoring Inputs</h2>
+        <label class="field">
+          <span>NDVI Dates</span>
+          <select id="dateSelect" multiple></select>
+          <small>Leave empty to auto-select latest NDVI date.</small>
+        </label>
+        <label class="field">
+          <span>Buffer (meters)</span>
+          <input id="bufferInput" type="number" min="0" value="20" />
+        </label>
+        <label class="field">
+          <span>NDVI Threshold</span>
+          <input id="thresholdInput" type="number" step="0.05" min="0" max="1" value="0.6" />
+        </label>
+        <button id="scoreButton" class="primary">Score</button>
+        <div class="warnings" id="warnings"></div>
+      </div>
+
+      <div class="card">
+        <h2>Segment Results</h2>
+        <div class="table-wrapper">
+          <table id="segmentsTable">
+            <thead>
+              <tr>
+                <th>Segment</th>
+                <th>Mean NDVI</th>
+                <th>P90 NDVI</th>
+                <th>% &gt; 0.6</th>
+                <th>Risk Score</th>
+                <th>Risk Category</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Trend Table</h2>
+        <div class="table-wrapper">
+          <table id="trendTable">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Segment</th>
+                <th>Mean NDVI</th>
+                <th>Risk Score</th>
+                <th>Risk Category</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="map-area">
+      <div id="map"></div>
+      <div class="card chart-card">
+        <h2>Risk Trend Chart</h2>
+        <div id="trendChart"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

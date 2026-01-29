@@ -1,0 +1,144 @@
+:root {
+  color-scheme: light;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  background: #f4f6f9;
+  color: #1f2933;
+}
+
+body {
+  margin: 0;
+  background: #f4f6f9;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 24px;
+  background: #ffffff;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.app-header h1 {
+  margin: 0 0 4px;
+  font-size: 22px;
+}
+
+.subtitle {
+  margin: 0;
+  color: #52606d;
+  font-size: 14px;
+}
+
+.status-pill {
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: #e2e8f0;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 360px 1fr;
+  gap: 16px;
+  padding: 16px 24px 24px;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.map-area {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+#map {
+  height: 520px;
+  border-radius: 12px;
+  border: 1px solid #d9e2ec;
+}
+
+.card {
+  background: #ffffff;
+  border-radius: 12px;
+  padding: 16px;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
+}
+
+.chart-card {
+  min-height: 260px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+  font-size: 14px;
+}
+
+.field span {
+  font-weight: 600;
+}
+
+.field select,
+.field input {
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid #d9e2ec;
+  font-size: 14px;
+}
+
+.primary {
+  width: 100%;
+  padding: 10px 12px;
+  border: none;
+  border-radius: 8px;
+  background: #1d4ed8;
+  color: #ffffff;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.primary:disabled {
+  background: #94a3b8;
+  cursor: not-allowed;
+}
+
+.table-wrapper {
+  overflow-x: auto;
+}
+
+.table-wrapper table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.table-wrapper th,
+.table-wrapper td {
+  padding: 6px 8px;
+  border-bottom: 1px solid #e5e7eb;
+  text-align: left;
+}
+
+.warnings {
+  font-size: 12px;
+  color: #b91c1c;
+  margin-top: 8px;
+}
+
+@media (max-width: 960px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+
+  #map {
+    height: 420px;
+  }
+}
